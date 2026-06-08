@@ -89,7 +89,6 @@ type ProjectHistoryItem = {
 type DisplayProjectItem = ProjectHistoryItem & { isTransient?: boolean };
 
 const MAX_SEGMENT_CHARACTERS = 320;
-const AUTO_SPLIT_DELAY_MS = 1800;
 const ACCEPTED_MODEL_EXTENSIONS = new Set([".pt", ".pth", ".bin"]);
 const PRESET_MODEL_ID_PREFIX = "preset:";
 const PREMIERE_XML_FPS = 30;
@@ -139,7 +138,7 @@ const buildPresetModelItems = (presets: { name: string; size: number }[]): Model
   }));
 
 const splitOversizedBlock = (block: string, maxChars: number): string[] => {
-  const cleaned = block.trim();
+  const cleaned = block;
   if (cleaned.length <= maxChars) {
     return [cleaned];
   }
@@ -174,12 +173,53 @@ const splitOversizedBlock = (block: string, maxChars: number): string[] => {
 };
 
 const splitTextIntoParagraphs = (text: string): string[] => {
-  const baseBlocks = text
-    .split(/\n\s*\n+/)
-    .map((block) => block.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
+  const normalizedText = text.replace(/\r\n?/g, "\n");
+  const rawBlocks = normalizedText.split(/\n+/);
+  const hasTrailingParagraph = /\n$/.test(normalizedText);
+  const baseBlocks = rawBlocks
+    .map((block, index) => {
+      const normalizedBlock = block.replace(/[^\S\n]+/g, " ");
+      const hasText = normalizedBlock.trim().length > 0;
+      const isTrailingBlank = hasTrailingParagraph && index === rawBlocks.length - 1;
+      return hasText || isTrailingBlank ? normalizedBlock : null;
+    })
+    .filter((block): block is string => block !== null);
 
   return baseBlocks.flatMap((block) => splitOversizedBlock(block, MAX_SEGMENT_CHARACTERS));
+};
+
+const reconcileParagraphsFromTexts = (
+  previous: ParagraphItem[],
+  texts: string[],
+  defaultSpeakerModelId: string,
+): ParagraphItem[] => {
+  const usedIndexes = new Set<number>();
+
+  return texts.map<ParagraphItem>((text, index) => {
+    const exactIndex = previous.findIndex(
+      (item, candidateIndex) => !usedIndexes.has(candidateIndex) && item.text === text,
+    );
+    if (exactIndex >= 0) {
+      usedIndexes.add(exactIndex);
+      return previous[exactIndex];
+    }
+
+    const previousItem = !usedIndexes.has(index) ? previous[index] : undefined;
+    if (previousItem) {
+      usedIndexes.add(index);
+    }
+
+    return {
+      id: previousItem?.id ?? createId(),
+      text,
+      speakerModelId: previousItem?.speakerModelId ?? defaultSpeakerModelId,
+      speakerOverridden: previousItem?.speakerOverridden ?? false,
+      status: "pending",
+      error: undefined,
+      audioUrl: undefined,
+      audioBlob: undefined,
+    };
+  });
 };
 
 const areParagraphTextsEqual = (paragraphs: ParagraphItem[], texts: string[]): boolean =>
@@ -590,8 +630,10 @@ function App() {
   const runIdRef = useRef(0);
   const generationAbortControllerRef = useRef<AbortController | null>(null);
   const paragraphsRef = useRef<ParagraphItem[]>([]);
+  const paragraphTextareaRefsRef = useRef<Map<string, HTMLTextAreaElement>>(new Map());
+  const pendingParagraphFocusIdRef = useRef<string | null>(null);
+  const pendingParagraphFocusIndexRef = useRef<number | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const resegmentRequestedRef = useRef(false);
   const currentAudioCleanupRef = useRef<(() => void) | null>(null);
   const durationCacheRef = useRef<WeakMap<Blob, number>>(new WeakMap());
   const durationByUrlCacheRef = useRef<Map<string, number>>(new Map());
@@ -604,6 +646,18 @@ function App() {
   const activeProjectCreatedAtRef = useRef<number>(initialProjectTimestampRef.current);
   const hydratingProjectRef = useRef(false);
   const lastPersistedProjectSignatureRef = useRef<string | null>(null);
+
+  const setParagraphTextareaRef = useCallback(
+    (id: string, node: HTMLTextAreaElement | null): void => {
+      if (node) {
+        paragraphTextareaRefsRef.current.set(id, node);
+        return;
+      }
+
+      paragraphTextareaRefsRef.current.delete(id);
+    },
+    [],
+  );
 
   const applyPresetModels = useCallback((presets: VoicePreset[]): void => {
     setVoicePresets(presets);
@@ -684,6 +738,32 @@ function App() {
   useEffect(() => {
     paragraphsRef.current = paragraphs;
     setGenerationStatus(buildGenerationStatus(paragraphs));
+  }, [paragraphs]);
+
+  useEffect(() => {
+    const focusId = pendingParagraphFocusIdRef.current;
+    const focusIndex = pendingParagraphFocusIndexRef.current;
+    if (!focusId && focusIndex === null) {
+      return;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      const targetId = focusId ?? paragraphs[focusIndex ?? -1]?.id ?? null;
+      const target = targetId ? paragraphTextareaRefsRef.current.get(targetId) : null;
+      if (!target) {
+        return;
+      }
+
+      target.focus();
+      const cursorPosition = target.value.length;
+      target.setSelectionRange(cursorPosition, cursorPosition);
+      pendingParagraphFocusIdRef.current = null;
+      pendingParagraphFocusIndexRef.current = null;
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
   }, [paragraphs]);
 
   useEffect(() => {
@@ -800,7 +880,7 @@ function App() {
 
   const canGenerate =
     Boolean(selectedModel) &&
-    paragraphs.length > 0 &&
+    paragraphs.some((paragraph) => paragraph.text.trim().length > 0) &&
     generationStatus !== "running";
   const selectedParagraphIdSet = useMemo(
     () => new Set(selectedParagraphIds),
@@ -1122,6 +1202,32 @@ function App() {
     };
   }, [timelineCurrentIndex, timelineSegmentByParagraphIndex, totalTimelineDuration]);
 
+  const applyInputText = useCallback(
+    (nextInput: string): void => {
+      setInputText(nextInput);
+
+      if (generationStatus === "running") {
+        return;
+      }
+
+      const nextTexts = splitTextIntoParagraphs(nextInput);
+      setParagraphs((previous) => {
+        if (areParagraphTextsEqual(previous, nextTexts)) {
+          return previous;
+        }
+
+        const next = reconcileParagraphsFromTexts(previous, nextTexts, selectedModelId);
+        if (previous.length === 0 && next.length > 0) {
+          pendingParagraphFocusIdRef.current = next[0].id;
+          pendingParagraphFocusIndexRef.current = null;
+        }
+        return next;
+      });
+      setGlobalError(null);
+    },
+    [generationStatus, selectedModelId],
+  );
+
   useEffect(() => {
     if (hydratingProjectRef.current) {
       hydratingProjectRef.current = false;
@@ -1132,48 +1238,14 @@ function App() {
       return;
     }
 
-    // When the user is already editing paragraph blocks, only re-segment if it was explicitly requested
-    // by a deletion that emptied a paragraph (or all of them).
-    if (paragraphsRef.current.length > 0 && !resegmentRequestedRef.current) {
-      return;
-    }
+    const nextTexts = splitTextIntoParagraphs(inputText);
+    setParagraphs((previous) => {
+      if (areParagraphTextsEqual(previous, nextTexts)) {
+        return previous;
+      }
 
-    const nextInput = inputText.trim();
-    if (!nextInput) {
-      setParagraphs([]);
-      resegmentRequestedRef.current = false;
-      return;
-    }
-
-    const timeout = setTimeout(() => {
-      const nextTexts = splitTextIntoParagraphs(inputText);
-      setParagraphs((previous) => {
-        if (areParagraphTextsEqual(previous, nextTexts)) {
-          return previous;
-        }
-
-        return nextTexts.map<ParagraphItem>((text, index) => {
-          const previousItem = previous[index];
-          if (previousItem && previousItem.text === text) {
-            return previousItem;
-          }
-
-          return {
-            id: createId(),
-            text,
-            speakerModelId: selectedModelId,
-            speakerOverridden: false,
-            status: "pending",
-          };
-        });
-      });
-      setGlobalError(null);
-      resegmentRequestedRef.current = false;
-    }, AUTO_SPLIT_DELAY_MS);
-
-    return () => {
-      clearTimeout(timeout);
-    };
+      return reconcileParagraphsFromTexts(previous, nextTexts, selectedModelId);
+    });
   }, [inputText, generationStatus, selectedModelId]);
 
   const onCreateVoicePreset = async (payload: {
@@ -1418,7 +1490,9 @@ function App() {
       return;
     }
 
-    const ids = paragraphsRef.current.map((item) => item.id);
+    const ids = paragraphsRef.current
+      .filter((item) => item.text.trim().length > 0)
+      .map((item) => item.id);
     await generateParagraphBatch(ids);
   };
 
@@ -1428,12 +1502,18 @@ function App() {
       return;
     }
 
-    const ids = paragraphsRef.current.slice(startIndex).map((item) => item.id);
+    const ids = paragraphsRef.current
+      .slice(startIndex)
+      .filter((item) => item.text.trim().length > 0)
+      .map((item) => item.id);
     await generateParagraphBatch(ids);
   };
 
   const onGenerateSelectedParagraphs = async (): Promise<void> => {
-    await generateParagraphBatch(orderedSelectedParagraphIds);
+    const selectedNonEmptyIds = paragraphsRef.current
+      .filter((item) => orderedSelectedParagraphIds.includes(item.id) && item.text.trim().length > 0)
+      .map((item) => item.id);
+    await generateParagraphBatch(selectedNonEmptyIds);
   };
 
   const onRetryParagraph = async (id: string): Promise<void> => {
@@ -1460,31 +1540,19 @@ function App() {
   };
 
   const onParagraphTextChange = (id: string, text: string): void => {
-    setParagraphs((previous) => {
-      const current = previous.find((item) => item.id === id);
-      const isDeletion = Boolean(current) && text.length < (current?.text.length ?? 0);
-      const paragraphBecameEmpty =
-        isDeletion && Boolean(current?.text.trim()) && text.trim().length === 0;
+    const paragraphIndex = paragraphsRef.current.findIndex((item) => item.id === id);
+    if (text.endsWith("\n") && paragraphIndex >= 0) {
+      pendingParagraphFocusIdRef.current = null;
+      pendingParagraphFocusIndexRef.current = paragraphIndex + 1;
+    } else {
+      pendingParagraphFocusIdRef.current = id;
+      pendingParagraphFocusIndexRef.current = null;
+    }
 
-      const next = previous.map((item) =>
-        item.id === id
-          ? {
-              ...item,
-              text,
-              status: "pending" as const,
-              error: undefined,
-              audioUrl: undefined,
-              audioBlob: undefined,
-            }
-          : item,
-      );
-
-      const allParagraphsEmpty = next.every((paragraph) => paragraph.text.trim().length === 0);
-      resegmentRequestedRef.current = paragraphBecameEmpty || allParagraphsEmpty;
-
-      setInputText(next.map((paragraph) => paragraph.text).join("\n\n"));
-      return next;
-    });
+    const nextInput = paragraphsRef.current
+      .map((item) => (item.id === id ? text : item.text))
+      .join("\n");
+    applyInputText(nextInput);
   };
 
   const onParagraphSpeakerChange = (id: string, modelId: string): void => {
@@ -1516,7 +1584,6 @@ function App() {
       const [start, end] = anchor <= clickedIndex ? [anchor, clickedIndex] : [clickedIndex, anchor];
       const ids = paragraphsRef.current.slice(start, end + 1).map((paragraph) => paragraph.id);
       setSelectedParagraphIds(ids);
-      setActiveParagraphId(id);
       return;
     }
 
@@ -1530,11 +1597,10 @@ function App() {
         return [...previous, id];
       });
       paragraphSelectionAnchorIndexRef.current = clickedIndex;
-      setActiveParagraphId(id);
       return;
     }
 
-    if (isMultiSelectionClick && activeParagraphId === id) {
+    if (isMultiSelectionClick) {
       setSelectedParagraphIds([id]);
       paragraphSelectionAnchorIndexRef.current = clickedIndex;
     } else if (!isMultiSelectionClick) {
@@ -1547,8 +1613,23 @@ function App() {
       }
     }
 
-    setActiveParagraphId(id);
     event.currentTarget.select();
+  };
+
+  const onParagraphContextMenu = (id: string, event: MouseEvent<HTMLElement>): void => {
+    event.preventDefault();
+
+    const clickedIndex = paragraphsRef.current.findIndex((paragraph) => paragraph.id === id);
+    if (clickedIndex === -1) {
+      return;
+    }
+
+    if (!selectedParagraphIdSet.has(id)) {
+      setSelectedParagraphIds([id]);
+      paragraphSelectionAnchorIndexRef.current = clickedIndex;
+    }
+
+    setActiveParagraphId(id);
   };
 
   const releaseCurrentAudioSource = (): void => {
@@ -1596,7 +1677,6 @@ function App() {
     setSelectedParagraphIds([]);
     paragraphSelectionAnchorIndexRef.current = null;
     setGenerationStatus("idle");
-    resegmentRequestedRef.current = false;
     activeProjectCreatedAtRef.current = timestamp;
     lastPersistedProjectSignatureRef.current = null;
     setActiveProjectId(createId());
@@ -1614,7 +1694,6 @@ function App() {
       generationAbortControllerRef.current = null;
       runIdRef.current = Date.now();
       resetSessionPlaybackState();
-      resegmentRequestedRef.current = false;
       hydratingProjectRef.current = true;
 
       const hydratedParagraphs: ParagraphItem[] = project.paragraphs.map((paragraph) =>
@@ -2459,9 +2538,9 @@ function App() {
                   {paragraphs.length === 0 ? (
                     <Textarea
                       className="min-h-56 resize-none border-0 bg-transparent px-0 shadow-none outline-none focus-visible:ring-0"
-                      placeholder="Paste long text here... it will auto-split into paragraphs after a few seconds."
+                      placeholder="Start typing or paste text here... paragraphs appear as you write."
                       value={inputText}
-                      onChange={(event) => setInputText(event.target.value)}
+                      onChange={(event) => applyInputText(event.target.value)}
                       disabled={generationStatus === "running"}
                     />
                   ) : (
@@ -2490,6 +2569,7 @@ function App() {
                                   ? "rounded-md bg-muted/40"
                                   : ""
                             }`}
+                            onContextMenu={(event) => onParagraphContextMenu(item.id, event)}
                           >
                             <PopoverTrigger asChild>
                               <button
@@ -2602,6 +2682,7 @@ function App() {
                             ) : null}
 
                             <Textarea
+                              ref={(node) => setParagraphTextareaRef(item.id, node)}
                               className={`min-h-16 resize-none border-0 bg-transparent px-0 pr-5 pl-7 shadow-none outline-none selection:bg-sky-200 selection:text-foreground focus-visible:ring-0 ${
                                 generationStatus === "running" && item.status === "ok"
                                   ? "cursor-pointer"
