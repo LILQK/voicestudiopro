@@ -4,10 +4,13 @@ import { api, type GenerationJob } from "../../shared/api/client";
 import { Button } from "../../shared/components/Button";
 import { Progress } from "../../shared/components/Progress";
 import { useStudioStore } from "../../shared/state/studioStore";
+import { createId } from "../../shared/utils/text";
 
 export function ScriptEditor() {
   const [job, setJob] = useState<GenerationJob | null>(null);
   const pollRef = useRef<number | null>(null);
+  const paragraphRefs = useRef<Map<string, HTMLTextAreaElement | null>>(new Map());
+  const pendingFocusId = useRef<string | null>(null);
   const text = useStudioStore((state) => state.text);
   const paragraphs = useStudioStore((state) => state.paragraphs);
   const runtime = useStudioStore((state) => state.runtime);
@@ -23,6 +26,51 @@ export function ScriptEditor() {
       if (pollRef.current) window.clearInterval(pollRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    const focusId = pendingFocusId.current;
+    if (!focusId) return;
+    const target = paragraphRefs.current.get(focusId);
+    if (target) {
+      target.focus();
+      target.setSelectionRange(0, 0);
+      pendingFocusId.current = null;
+    }
+  }, [paragraphs]);
+
+  const splitParagraphAtCursor = (
+    paragraphId: string,
+    textarea: HTMLTextAreaElement,
+  ) => {
+    const value = textarea.value;
+    const selectionStart = textarea.selectionStart ?? value.length;
+    const before = value.slice(0, selectionStart);
+    const after = value.slice(selectionStart);
+    const newId = createId();
+    pendingFocusId.current = newId;
+    setParagraphs(
+      paragraphs.flatMap((item) => {
+        if (item.id !== paragraphId) return [item];
+        const beforeTrimmed = before.replace(/\s+$/, "");
+        const afterTrimmed = after.replace(/^\s+/, "");
+        return [
+          {
+            ...item,
+            text: beforeTrimmed,
+          },
+          {
+            ...item,
+            id: newId,
+            text: afterTrimmed,
+            status: "pending" as const,
+            audio_url: null,
+            audio_path: null,
+            error: null,
+          },
+        ];
+      }),
+    );
+  };
 
   const generate = async () => {
     const targetParagraphs =
@@ -164,6 +212,9 @@ export function ScriptEditor() {
             <article key={paragraph.id} className={`paragraph-row status-${paragraph.status}`}>
               <span className="paragraph-index">{index + 1}</span>
               <textarea
+                ref={(node) => {
+                  paragraphRefs.current.set(paragraph.id, node);
+                }}
                 value={paragraph.text}
                 onChange={(event) =>
                   setParagraphs(
@@ -172,6 +223,12 @@ export function ScriptEditor() {
                     ),
                   )
                 }
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    splitParagraphAtCursor(paragraph.id, event.currentTarget);
+                  }
+                }}
               />
               <div className="paragraph-actions">
                 {paragraph.audio_url ? (
