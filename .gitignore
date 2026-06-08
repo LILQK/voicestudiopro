@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+frontend/dist/
+dist/
+build/
+.env
+.runtime/
+*.log
+.playwright-mcp/
+*.egg-info/

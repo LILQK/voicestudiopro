@@ -1,0 +1,2 @@
+"""VoiceStudio Pro application package."""
+
