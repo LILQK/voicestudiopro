@@ -1,9 +1,30 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import JSZip from "jszip";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { VoiceManagerDrawer } from "@/components/voice-manager-drawer";
+import { exportPremierePackage, exportWav } from "@/features/export/exportAudio";
 import { ExportMenu } from "@/features/export/ExportMenu";
 import { ProjectsPanel, type DisplayProjectItem } from "@/features/projects/ProjectsPanel";
+import {
+  buildProjectContentSignature,
+  buildProjectName,
+  hasMeaningfulSessionData,
+  sortProjectHistory,
+  toHistoryItem,
+  upsertHistoryItem,
+} from "@/features/projects/projectSession";
+import { formatBytes, formatDurationLabel } from "@/features/studio/formatters";
+import {
+  areParagraphTextsEqual,
+  buildGenerationStatus,
+  buildPresetModelItems,
+  createId,
+  hasParagraphAudio,
+  normalizeGeneratingStatus,
+  PRESET_MODEL_ID_PREFIX,
+  recoverInterruptedParagraph,
+  reconcileParagraphsFromTexts,
+  splitTextIntoParagraphs,
+} from "@/features/studio/paragraphModel";
 import { ScriptWorkspace } from "@/features/studio/ScriptWorkspace";
 import { TimelineFooter } from "@/features/studio/TimelineFooter";
 import type {
@@ -11,17 +32,15 @@ import type {
   GenerationStatus,
   ModelItem,
   ParagraphItem,
-  ParagraphStatus,
   ProjectHistoryItem,
 } from "@/features/studio/types";
 import { VoiceRuntimePanel } from "@/features/studio/VoiceRuntimePanel";
 import { useGenerationQueue } from "@/features/studio/useGenerationQueue";
+import { useTimelinePlayback } from "@/features/studio/useTimelinePlayback";
 import {
-  buildAudioProxyUrl,
   createVoicePreset,
   deleteGeneratedAudioViaProxy,
   deleteVoicePreset,
-  fetchAudioViaProxy,
   getQwenStatus,
   getVoicePresets,
   renameVoicePreset as renameVoicePresetApi,
@@ -35,511 +54,10 @@ import {
   renameProject as renameStoredProject,
   upsertProject,
   type StoredParagraph,
-  type StoredParagraphStatus,
   type StoredProject,
 } from "@/lib/projectsStore";
-const MAX_SEGMENT_CHARACTERS = 320;
 const ACCEPTED_MODEL_EXTENSIONS = new Set([".pt", ".pth", ".bin"]);
-const PRESET_MODEL_ID_PREFIX = "preset:";
-const PREMIERE_XML_FPS = 30;
-const PREMIERE_XML_PAUSE_SECONDS = 1;
-const PREMIERE_AUDIO_SAMPLE_RATE = 48_000;
 
-const createId = (): string =>
-  typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-
-const formatBytes = (bytes: number): string => {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-
-  const kb = bytes / 1024;
-  if (kb < 1024) {
-    return `${kb.toFixed(1)} KB`;
-  }
-
-  return `${(kb / 1024).toFixed(2)} MB`;
-};
-
-const formatDurationLabel = (seconds: number): string => {
-  const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
-  const total = Math.floor(safe);
-  const mins = Math.floor(total / 60);
-  const secs = total % 60;
-  return `${mins}:${secs.toString().padStart(2, "0")}`;
-};
-
-const twoDigits = (value: number): string => value.toString().padStart(2, "0");
-
-const buildProjectName = (timestampMs: number): string => {
-  const date = new Date(timestampMs);
-  return `Project ${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())} ${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())}`;
-};
-
-const buildPresetModelItems = (presets: { id: string; name: string; size: number }[]): ModelItem[] =>
-  presets.map((preset) => ({
-    id: `${PRESET_MODEL_ID_PREFIX}${preset.id}`,
-    name: preset.name,
-    size: preset.size,
-    source: "preset",
-    presetName: preset.id,
-  }));
-
-const splitOversizedBlock = (block: string, maxChars: number): string[] => {
-  const cleaned = block;
-  if (cleaned.length <= maxChars) {
-    return [cleaned];
-  }
-
-  const pieces: string[] = [];
-  let cursor = cleaned;
-
-  while (cursor.length > maxChars) {
-    let splitIndex = -1;
-    for (let index = maxChars; index < cursor.length; index += 1) {
-      const char = cursor[index];
-      if (char === "." || char === ";") {
-        splitIndex = index;
-        break;
-      }
-    }
-
-    // Never break in the middle if no punctuation appears after the threshold.
-    if (splitIndex === -1) {
-      break;
-    }
-
-    pieces.push(cursor.slice(0, splitIndex + 1).trim());
-    cursor = cursor.slice(splitIndex + 1).trim();
-  }
-
-  if (cursor) {
-    pieces.push(cursor);
-  }
-
-  return pieces;
-};
-
-const splitTextIntoParagraphs = (text: string): string[] => {
-  const normalizedText = text.replace(/\r\n?/g, "\n");
-  const rawBlocks = normalizedText.split(/\n+/);
-  const hasTrailingParagraph = /\n$/.test(normalizedText);
-  const baseBlocks = rawBlocks
-    .map((block, index) => {
-      const normalizedBlock = block.replace(/[^\S\n]+/g, " ");
-      const hasText = normalizedBlock.trim().length > 0;
-      const isTrailingBlank = hasTrailingParagraph && index === rawBlocks.length - 1;
-      return hasText || isTrailingBlank ? normalizedBlock : null;
-    })
-    .filter((block): block is string => block !== null);
-
-  return baseBlocks.flatMap((block) => splitOversizedBlock(block, MAX_SEGMENT_CHARACTERS));
-};
-
-const reconcileParagraphsFromTexts = (
-  previous: ParagraphItem[],
-  texts: string[],
-  defaultSpeakerModelId: string,
-): ParagraphItem[] => {
-  const usedIndexes = new Set<number>();
-
-  return texts.map<ParagraphItem>((text, index) => {
-    const exactIndex = previous.findIndex(
-      (item, candidateIndex) => !usedIndexes.has(candidateIndex) && item.text === text,
-    );
-    if (exactIndex >= 0) {
-      usedIndexes.add(exactIndex);
-      return previous[exactIndex];
-    }
-
-    const previousItem = !usedIndexes.has(index) ? previous[index] : undefined;
-    if (previousItem) {
-      usedIndexes.add(index);
-    }
-
-    return {
-      id: previousItem?.id ?? createId(),
-      text,
-      speakerModelId: previousItem?.speakerModelId ?? defaultSpeakerModelId,
-      speakerOverridden: previousItem?.speakerOverridden ?? false,
-      status: "pending",
-      error: undefined,
-      audioUrl: undefined,
-      audioBlob: undefined,
-    };
-  });
-};
-
-const areParagraphTextsEqual = (paragraphs: ParagraphItem[], texts: string[]): boolean =>
-  paragraphs.length === texts.length &&
-  paragraphs.every((paragraph, index) => paragraph.text === texts[index]);
-
-const buildGenerationStatus = (paragraphs: ParagraphItem[]): GenerationStatus => {
-  if (paragraphs.some((paragraph) => paragraph.status === "generating")) {
-    return "running";
-  }
-  if (paragraphs.length > 0 && paragraphs.every((paragraph) => paragraph.status === "ok")) {
-    return "completed";
-  }
-  if (paragraphs.some((paragraph) => paragraph.status === "error")) {
-    return "partial_error";
-  }
-  return "idle";
-};
-
-const normalizeGeneratingStatus = (
-  status: ParagraphStatus | StoredParagraphStatus,
-  hasAudio: boolean,
-): ParagraphStatus => {
-  if (status !== "generating") {
-    return status;
-  }
-
-  return hasAudio ? "ok" : "pending";
-};
-
-const recoverInterruptedParagraph = (
-  paragraph: ParagraphItem,
-  reason: "cancelled" | "restored",
-): ParagraphItem => {
-  if (paragraph.status !== "generating") {
-    return paragraph;
-  }
-
-  const hasAudio = hasParagraphAudio(paragraph);
-  return {
-    ...paragraph,
-    status: normalizeGeneratingStatus(paragraph.status, hasAudio),
-    error: hasAudio ? undefined : reason === "cancelled" ? "Generation cancelled." : undefined,
-  };
-};
-
-const hasParagraphAudio = (paragraph: ParagraphItem): boolean =>
-  Boolean(paragraph.audioUrl || paragraph.audioBlob);
-
-const getParagraphAudioSource = (
-  paragraph: ParagraphItem,
-): { src: string; cleanup?: () => void } | null => {
-  if (paragraph.audioUrl) {
-    return { src: buildAudioProxyUrl(paragraph.audioUrl) };
-  }
-
-  if (paragraph.audioBlob) {
-    const objectUrl = URL.createObjectURL(paragraph.audioBlob);
-    return {
-      src: objectUrl,
-      cleanup: () => URL.revokeObjectURL(objectUrl),
-    };
-  }
-
-  return null;
-};
-
-const sortProjectHistory = (items: ProjectHistoryItem[]): ProjectHistoryItem[] =>
-  [...items].sort((left, right) => right.updatedAt - left.updatedAt);
-
-const toHistoryItem = (project: StoredProject): ProjectHistoryItem => ({
-  id: project.id,
-  name: project.name,
-  createdAt: project.createdAt,
-  updatedAt: project.updatedAt,
-});
-
-const upsertHistoryItem = (
-  previous: ProjectHistoryItem[],
-  item: ProjectHistoryItem,
-): ProjectHistoryItem[] =>
-  sortProjectHistory([item, ...previous.filter((project) => project.id !== item.id)]);
-
-const hasMeaningfulSessionData = (inputText: string, paragraphs: ParagraphItem[]): boolean => {
-  if (inputText.trim().length > 0) {
-    return true;
-  }
-
-  return paragraphs.some(
-    (paragraph) => paragraph.text.trim().length > 0 || hasParagraphAudio(paragraph),
-  );
-};
-
-const buildProjectContentSignature = (
-  inputText: string,
-  selectedModelId: string,
-  paragraphs: ParagraphItem[],
-): string =>
-  JSON.stringify({
-    inputText,
-    selectedModelId,
-    paragraphs: paragraphs.map((paragraph) => ({
-      id: paragraph.id,
-      text: paragraph.text,
-      speakerModelId: paragraph.speakerModelId,
-      speakerOverridden: paragraph.speakerOverridden,
-      status: paragraph.status,
-      error: paragraph.error ?? "",
-      audioUrl: paragraph.audioUrl ?? "",
-      audioSize: paragraph.audioBlob?.size ?? 0,
-      audioType: paragraph.audioBlob?.type ?? "",
-    })),
-  });
-
-const encodeWav = (buffer: AudioBuffer): Blob => {
-  const channels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const frames = buffer.length;
-  const bytesPerSample = 2;
-  const dataSize = frames * channels * bytesPerSample;
-  const wavBuffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(wavBuffer);
-
-  const writeString = (offset: number, value: string): void => {
-    for (let index = 0; index < value.length; index += 1) {
-      view.setUint8(offset + index, value.charCodeAt(index));
-    }
-  };
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, channels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * channels * bytesPerSample, true);
-  view.setUint16(32, channels * bytesPerSample, true);
-  view.setUint16(34, 8 * bytesPerSample, true);
-  writeString(36, "data");
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let frame = 0; frame < frames; frame += 1) {
-    for (let channel = 0; channel < channels; channel += 1) {
-      const sample = buffer.getChannelData(channel)[frame] ?? 0;
-      const clamped = Math.max(-1, Math.min(1, sample));
-      view.setInt16(offset, clamped < 0 ? clamped * 32768 : clamped * 32767, true);
-      offset += bytesPerSample;
-    }
-  }
-
-  return new Blob([wavBuffer], { type: "audio/wav" });
-};
-
-const downloadBlob = (blob: Blob, fileName: string): void => {
-  const downloadUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = downloadUrl;
-  link.download = fileName;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(downloadUrl);
-};
-
-const xmlEscape = (value: string): string =>
-  value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-
-const secondsToTimelineFrames = (seconds: number): number =>
-  Math.max(1, Math.ceil(Math.max(0, seconds) * PREMIERE_XML_FPS));
-
-type PremiereExportClip = {
-  name: string;
-  fileName: string;
-  pathUrl: string;
-  text: string;
-  speakerName: string;
-  durationSeconds: number;
-  durationFrames: number;
-  startFrame: number;
-  endFrame: number;
-};
-
-const buildPremiereXml = (clips: PremiereExportClip[], sequenceName: string): string => {
-  const totalFrames = clips.length > 0 ? clips[clips.length - 1].endFrame : 0;
-  const safeSequenceName = xmlEscape(sequenceName);
-  const videoFormat = `          <format>
-            <samplecharacteristics>
-              <width>1920</width>
-              <height>1080</height>
-              <anamorphic>FALSE</anamorphic>
-              <pixelaspectratio>square</pixelaspectratio>
-              <fielddominance>none</fielddominance>
-              <rate>
-                <timebase>${PREMIERE_XML_FPS}</timebase>
-                <ntsc>FALSE</ntsc>
-              </rate>
-              <colordepth>24</colordepth>
-            </samplecharacteristics>
-          </format>`;
-  const audioOutputs = `          <outputs>
-            <group>
-              <index>1</index>
-              <numchannels>2</numchannels>
-              <downmix>0</downmix>
-              <channel>
-                <index>1</index>
-              </channel>
-              <channel>
-                <index>2</index>
-              </channel>
-            </group>
-          </outputs>`;
-  const buildTrackClipItems = (trackIndex: 1 | 2): string =>
-    clips
-      .map((clip, index) => {
-        const clipId = `clipitem-${index + 1}-${trackIndex}`;
-        const fileId = `file-${index + 1}`;
-        const safeName = xmlEscape(clip.name);
-        const safeFileName = xmlEscape(clip.fileName);
-        const pathUrl = xmlEscape(clip.pathUrl);
-
-        return `            <clipitem id="${clipId}">
-              <name>${safeName}</name>
-              <duration>${clip.durationFrames}</duration>
-              <rate>
-                <timebase>${PREMIERE_XML_FPS}</timebase>
-                <ntsc>FALSE</ntsc>
-              </rate>
-              <enabled>TRUE</enabled>
-              <start>${clip.startFrame}</start>
-              <end>${clip.endFrame}</end>
-              <in>0</in>
-              <out>${clip.durationFrames}</out>
-              <file id="${fileId}">
-                <name>${safeFileName}</name>
-                <pathurl>${pathUrl}</pathurl>
-                <rate>
-                  <timebase>${PREMIERE_XML_FPS}</timebase>
-                  <ntsc>FALSE</ntsc>
-                </rate>
-                <duration>${clip.durationFrames}</duration>
-                <timecode>
-                  <rate>
-                    <timebase>${PREMIERE_XML_FPS}</timebase>
-                    <ntsc>FALSE</ntsc>
-                  </rate>
-                  <string>00:00:00:00</string>
-                  <frame>0</frame>
-                  <displayformat>NDF</displayformat>
-                </timecode>
-                <media>
-                  <audio>
-                    <samplecharacteristics>
-                      <depth>16</depth>
-                      <samplerate>${PREMIERE_AUDIO_SAMPLE_RATE}</samplerate>
-                    </samplecharacteristics>
-                    <channelcount>2</channelcount>
-                  </audio>
-                </media>
-              </file>
-              <sourcetrack>
-                <mediatype>audio</mediatype>
-                <trackindex>${trackIndex}</trackindex>
-              </sourcetrack>
-            </clipitem>`;
-      })
-      .join("\n");
-  const audioTracks = ([1, 2] as const)
-    .map((clip, index) => {
-      const outputIndex = index + 1;
-      return `          <track>
-${buildTrackClipItems(clip)}
-            <enabled>TRUE</enabled>
-            <locked>FALSE</locked>
-            <outputchannelindex>${outputIndex}</outputchannelindex>
-          </track>`;
-    })
-    .join("\n");
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE xmeml>
-<xmeml version="4">
-  <project>
-    <name>${safeSequenceName}</name>
-    <children>
-      <sequence id="sequence-1">
-        <name>${safeSequenceName}</name>
-        <duration>${totalFrames}</duration>
-        <rate>
-          <timebase>${PREMIERE_XML_FPS}</timebase>
-          <ntsc>FALSE</ntsc>
-        </rate>
-        <timecode>
-          <rate>
-            <timebase>${PREMIERE_XML_FPS}</timebase>
-            <ntsc>FALSE</ntsc>
-          </rate>
-          <string>00:00:00:00</string>
-          <frame>0</frame>
-          <displayformat>NDF</displayformat>
-        </timecode>
-        <media>
-          <video>
-${videoFormat}
-            <track>
-              <enabled>TRUE</enabled>
-              <locked>FALSE</locked>
-            </track>
-          </video>
-          <audio>
-            <format>
-              <samplecharacteristics>
-                <depth>16</depth>
-                <samplerate>${PREMIERE_AUDIO_SAMPLE_RATE}</samplerate>
-              </samplecharacteristics>
-            </format>
-${audioOutputs}
-${audioTracks}
-          </audio>
-        </media>
-      </sequence>
-    </children>
-  </project>
-</xmeml>
-`;
-};
-
-const resampleBuffer = async (buffer: AudioBuffer, targetRate: number): Promise<AudioBuffer> => {
-  if (buffer.sampleRate === targetRate) {
-    return buffer;
-  }
-
-  const offlineContext = new OfflineAudioContext(
-    buffer.numberOfChannels,
-    Math.ceil(buffer.duration * targetRate),
-    targetRate,
-  );
-
-  const source = offlineContext.createBufferSource();
-  source.buffer = buffer;
-  source.connect(offlineContext.destination);
-  source.start(0);
-
-  return offlineContext.startRendering();
-};
-
-const ensureChannelCount = (
-  buffer: AudioBuffer,
-  targetChannels: number,
-  audioContext: BaseAudioContext,
-): AudioBuffer => {
-  if (buffer.numberOfChannels === targetChannels) {
-    return buffer;
-  }
-
-  const normalized = audioContext.createBuffer(targetChannels, buffer.length, buffer.sampleRate);
-  for (let channel = 0; channel < targetChannels; channel += 1) {
-    const sourceChannel = Math.min(channel, buffer.numberOfChannels - 1);
-    normalized.copyToChannel(buffer.getChannelData(sourceChannel), channel);
-  }
-  return normalized;
-};
 
 function App() {
   const initialProjectTimestampRef = useRef<number>(Date.now());
@@ -563,26 +81,12 @@ function App() {
   const [exportingKind, setExportingKind] = useState<ExportKind | null>(null);
   const [activeParagraphId, setActiveParagraphId] = useState<string | null>(null);
   const [selectedParagraphIds, setSelectedParagraphIds] = useState<string[]>([]);
-  const [playingParagraphId, setPlayingParagraphId] = useState<string | null>(null);
-  const [paragraphDurations, setParagraphDurations] = useState<Record<string, number>>({});
-  const [timelinePositionSec, setTimelinePositionSec] = useState(0);
-  const [isTimelinePlaying, setIsTimelinePlaying] = useState(false);
-  const [timelineCurrentIndex, setTimelineCurrentIndex] = useState<number | null>(null);
   const [isVoiceManagerOpen, setIsVoiceManagerOpen] = useState(false);
 
   const paragraphsRef = useRef<ParagraphItem[]>([]);
   const paragraphTextareaRefsRef = useRef<Map<string, HTMLTextAreaElement>>(new Map());
   const pendingParagraphFocusIdRef = useRef<string | null>(null);
   const pendingParagraphFocusIndexRef = useRef<number | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const currentAudioCleanupRef = useRef<(() => void) | null>(null);
-  const durationCacheRef = useRef<WeakMap<Blob, number>>(new WeakMap());
-  const durationByUrlCacheRef = useRef<Map<string, number>>(new Map());
-  const playbackSourceRef = useRef<"manual" | "timeline" | null>(null);
-  const seekRequestIdRef = useRef(0);
-  const shouldResumeAfterSeekRef = useRef(false);
-  const isTimelineScrubbingRef = useRef(false);
-  const timelinePlayingRef = useRef(false);
   const paragraphSelectionAnchorIndexRef = useRef<number | null>(null);
   const activeProjectCreatedAtRef = useRef<number>(initialProjectTimestampRef.current);
   const hydratingProjectRef = useRef(false);
@@ -708,10 +212,6 @@ function App() {
   }, [paragraphs]);
 
   useEffect(() => {
-    timelinePlayingRef.current = isTimelinePlaying;
-  }, [isTimelinePlaying]);
-
-  useEffect(() => {
     if (!activeParagraphId) {
       return;
     }
@@ -798,6 +298,31 @@ function App() {
     [paragraphs, selectedParagraphIdSet],
   );
   const {
+    clearActiveAudio,
+    hasPlayableTimeline,
+    isTimelinePlaying,
+    isTimelineScrubbingRef,
+    onParagraphPlaybackToggle,
+    onTimelineScrubEnd,
+    onTimelineScrubStart,
+    onTimelineSeek,
+    onTimelineToggle,
+    playableParagraphIndexes,
+    playingParagraphId,
+    positionSec: timelinePositionSec,
+    resetPlaybackState,
+    setParagraphDurations,
+    setPositionSec: setTimelinePositionSec,
+    shouldResumeAfterSeekRef,
+    timelineCurrentIndex,
+    timelineCurrentParagraph,
+    totalTimelineDuration,
+  } = useTimelinePlayback({
+    paragraphs,
+    paragraphsRef,
+    setActiveParagraphId,
+  });
+  const {
     abortGeneration,
     cancelGeneration: onCancelGeneration,
     generateAll: onGenerateAll,
@@ -852,7 +377,7 @@ function App() {
       abortGeneration();
       clearActiveAudio();
     };
-  }, [abortGeneration]);
+  }, [abortGeneration, clearActiveAudio]);
 
   useEffect(() => {
     if (models.length === 0) {
@@ -962,205 +487,6 @@ function App() {
     !isExporting &&
     paragraphs.length > 0 &&
     paragraphs.every((paragraph) => paragraph.status === "ok" && hasParagraphAudio(paragraph));
-
-  const playableParagraphIndexes = useMemo(
-    () =>
-      paragraphs.reduce<number[]>((acc, paragraph, index) => {
-        if (paragraph.status === "ok" && hasParagraphAudio(paragraph)) {
-          acc.push(index);
-        }
-        return acc;
-      }, []),
-    [paragraphs],
-  );
-
-  const timelineSegments = useMemo(() => {
-    let cursor = 0;
-    return playableParagraphIndexes.map((paragraphIndex) => {
-      const paragraph = paragraphs[paragraphIndex];
-      const duration = Math.max(paragraphDurations[paragraph?.id ?? ""] ?? 0, 0);
-      const segment = {
-        paragraphIndex,
-        paragraphId: paragraph?.id ?? "",
-        start: cursor,
-        end: cursor + duration,
-        duration,
-      };
-      cursor += duration;
-      return segment;
-    });
-  }, [playableParagraphIndexes, paragraphs, paragraphDurations]);
-
-  const timelineSegmentByParagraphIndex = useMemo(() => {
-    const map = new Map<number, (typeof timelineSegments)[number]>();
-    for (const segment of timelineSegments) {
-      map.set(segment.paragraphIndex, segment);
-    }
-    return map;
-  }, [timelineSegments]);
-
-  const totalTimelineDuration =
-    timelineSegments.length > 0 ? timelineSegments[timelineSegments.length - 1].end : 0;
-
-  const hasPlayableTimeline = playableParagraphIndexes.length > 0;
-  const timelineCurrentParagraph =
-    timelineCurrentIndex !== null ? paragraphs[timelineCurrentIndex] ?? null : null;
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const playableParagraphs = paragraphs.filter(
-      (paragraph) => paragraph.status === "ok" && hasParagraphAudio(paragraph),
-    );
-
-    if (playableParagraphs.length === 0) {
-      setParagraphDurations((previous) => (Object.keys(previous).length === 0 ? previous : {}));
-      return;
-    }
-
-    const knownIds = new Set(playableParagraphs.map((paragraph) => paragraph.id));
-    setParagraphDurations((previous) => {
-      const nextEntries = Object.entries(previous).filter(([id]) => knownIds.has(id));
-      const next = Object.fromEntries(nextEntries);
-      const previousKeys = Object.keys(previous);
-      const nextKeys = Object.keys(next);
-      const isSame =
-        previousKeys.length === nextKeys.length &&
-        nextKeys.every((key) => previous[key] === next[key]);
-      return isSame ? previous : next;
-    });
-
-    const pending = playableParagraphs.filter((paragraph) => paragraphDurations[paragraph.id] === undefined);
-    if (pending.length === 0) {
-      return;
-    }
-
-    const readDuration = async (paragraph: ParagraphItem): Promise<number> => {
-      if (paragraph.audioUrl) {
-        const cached = durationByUrlCacheRef.current.get(paragraph.audioUrl);
-        if (cached !== undefined) {
-          return cached;
-        }
-
-        const audio = new Audio();
-        audio.preload = "metadata";
-        audio.src = buildAudioProxyUrl(paragraph.audioUrl);
-        const duration = await new Promise<number>((resolve) => {
-          const done = (value: number) => {
-            audio.onloadedmetadata = null;
-            audio.onerror = null;
-            resolve(Number.isFinite(value) && value > 0 ? value : 0);
-          };
-
-          audio.onloadedmetadata = () => done(audio.duration);
-          audio.onerror = () => done(0);
-        });
-
-        durationByUrlCacheRef.current.set(paragraph.audioUrl, duration);
-        return duration;
-      }
-
-      const blob = paragraph.audioBlob;
-      if (!blob) {
-        return 0;
-      }
-
-      const cached = durationCacheRef.current.get(blob);
-      if (cached !== undefined) {
-        return cached;
-      }
-
-      const objectUrl = URL.createObjectURL(blob);
-      const audio = new Audio();
-      audio.preload = "metadata";
-      audio.src = objectUrl;
-
-      const duration = await new Promise<number>((resolve) => {
-        const done = (value: number) => {
-          audio.onloadedmetadata = null;
-          audio.onerror = null;
-          URL.revokeObjectURL(objectUrl);
-          resolve(Number.isFinite(value) && value > 0 ? value : 0);
-        };
-
-        audio.onloadedmetadata = () => done(audio.duration);
-        audio.onerror = () => done(0);
-      });
-
-      durationCacheRef.current.set(blob, duration);
-      return duration;
-    };
-
-    void Promise.all(
-      pending.map(async (paragraph) => {
-        const duration = await readDuration(paragraph);
-        return { id: paragraph.id, duration };
-      }),
-    ).then((results) => {
-      if (cancelled) {
-        return;
-      }
-
-      setParagraphDurations((previous) => {
-        const next = { ...previous };
-        for (const item of results) {
-          next[item.id] = item.duration;
-        }
-        const previousKeys = Object.keys(previous);
-        const nextKeys = Object.keys(next);
-        const isSame =
-          previousKeys.length === nextKeys.length &&
-          nextKeys.every((key) => previous[key] === next[key]);
-        return isSame ? previous : next;
-      });
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [paragraphs, paragraphDurations]);
-
-  useEffect(() => {
-    if (hasPlayableTimeline) {
-      return;
-    }
-
-    if (playbackSourceRef.current === "timeline") {
-      clearActiveAudio();
-      playbackSourceRef.current = null;
-    }
-
-    setIsTimelinePlaying(false);
-    setTimelineCurrentIndex(null);
-    setTimelinePositionSec(0);
-  }, [hasPlayableTimeline]);
-
-  useEffect(() => {
-    if (timelineCurrentIndex === null) {
-      return;
-    }
-
-    const syncPosition = (): void => {
-      if (isTimelineScrubbingRef.current) {
-        return;
-      }
-
-      const audio = audioRef.current;
-      const segment = timelineSegmentByParagraphIndex.get(timelineCurrentIndex);
-      if (!audio || !segment) {
-        return;
-      }
-
-      const nextPosition = Math.min(totalTimelineDuration, segment.start + audio.currentTime);
-      setTimelinePositionSec(nextPosition);
-    };
-
-    syncPosition();
-    const intervalId = window.setInterval(syncPosition, 120);
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [timelineCurrentIndex, timelineSegmentByParagraphIndex, totalTimelineDuration]);
 
   const applyInputText = useCallback(
     (nextInput: string): void => {
@@ -1366,43 +692,10 @@ function App() {
     setActiveParagraphId(id);
   };
 
-  const releaseCurrentAudioSource = (): void => {
-    currentAudioCleanupRef.current?.();
-    currentAudioCleanupRef.current = null;
-  };
-
-  const clearActiveAudio = (): void => {
-    seekRequestIdRef.current += 1;
-    setPlayingParagraphId(null);
-
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.onended = null;
-      audioRef.current.onerror = null;
-      audioRef.current.onloadedmetadata = null;
-      audioRef.current = null;
-    }
-
-    releaseCurrentAudioSource();
-  };
-
-  const resetSessionPlaybackState = (): void => {
-    clearActiveAudio();
-    playbackSourceRef.current = null;
-    shouldResumeAfterSeekRef.current = false;
-    isTimelineScrubbingRef.current = false;
-    setPlayingParagraphId(null);
-    setActiveParagraphId(null);
-    setParagraphDurations({});
-    setIsTimelinePlaying(false);
-    setTimelineCurrentIndex(null);
-    setTimelinePositionSec(0);
-  };
-
   const onCreateNewProject = (): void => {
     const timestamp = Date.now();
     abortGeneration();
-    resetSessionPlaybackState();
+    resetPlaybackState();
     setGlobalError(null);
     setInputText("");
     setParagraphs([]);
@@ -1423,7 +716,7 @@ function App() {
       }
 
       abortGeneration();
-      resetSessionPlaybackState();
+      resetPlaybackState();
       hydratingProjectRef.current = true;
 
       const hydratedParagraphs: ParagraphItem[] = project.paragraphs.map((paragraph) =>
@@ -1553,312 +846,6 @@ function App() {
     }
   };
 
-  const findNextPlayableIndex = (startIndex: number): number => {
-    for (let index = startIndex; index < paragraphsRef.current.length; index += 1) {
-      const candidate = paragraphsRef.current[index];
-      if (candidate?.status === "ok" && hasParagraphAudio(candidate)) {
-        return index;
-      }
-    }
-
-    return -1;
-  };
-
-  const playTimelineFrom = (startIndex: number): void => {
-    const targetIndex = findNextPlayableIndex(startIndex);
-
-    if (targetIndex === -1) {
-      setIsTimelinePlaying(false);
-      setTimelineCurrentIndex(null);
-      playbackSourceRef.current = null;
-      return;
-    }
-
-    const target = paragraphsRef.current[targetIndex];
-    const targetSource = target ? getParagraphAudioSource(target) : null;
-    if (!targetSource || !target) {
-      setIsTimelinePlaying(false);
-      return;
-    }
-
-    const segment = timelineSegmentByParagraphIndex.get(targetIndex);
-    const baseOffset = segment?.start ?? 0;
-
-    clearActiveAudio();
-
-    const audio = new Audio(targetSource.src);
-    audioRef.current = audio;
-    currentAudioCleanupRef.current = targetSource.cleanup ?? null;
-    playbackSourceRef.current = "timeline";
-    setTimelineCurrentIndex(targetIndex);
-    setActiveParagraphId(target.id);
-    setPlayingParagraphId(target.id);
-    setTimelinePositionSec(baseOffset);
-    setIsTimelinePlaying(true);
-
-    audio.onended = () => {
-      setPlayingParagraphId(null);
-      releaseCurrentAudioSource();
-
-      if (audioRef.current === audio) {
-        audioRef.current = null;
-      }
-
-      if (playbackSourceRef.current !== "timeline" || !timelinePlayingRef.current) {
-        return;
-      }
-
-      playTimelineFrom(targetIndex + 1);
-    };
-
-    audio.onerror = () => {
-      setPlayingParagraphId(null);
-      releaseCurrentAudioSource();
-
-      if (audioRef.current === audio) {
-        audioRef.current = null;
-      }
-
-      if (playbackSourceRef.current === "timeline" && timelinePlayingRef.current) {
-        playTimelineFrom(targetIndex + 1);
-      }
-    };
-
-    void audio.play().catch(() => {
-      setPlayingParagraphId(null);
-      setIsTimelinePlaying(false);
-    });
-  };
-
-  const onTimelineSeek = (requested: number, forceResume = false): void => {
-    if (!Number.isFinite(requested) || timelineSegments.length === 0) {
-      return;
-    }
-
-    const clamped = Math.max(0, Math.min(requested, totalTimelineDuration));
-    setTimelinePositionSec(clamped);
-
-    const targetSegment =
-      timelineSegments.find((segment) => clamped <= segment.end) ?? timelineSegments[timelineSegments.length - 1];
-    if (!targetSegment) {
-      return;
-    }
-
-    const targetParagraph = paragraphsRef.current[targetSegment.paragraphIndex];
-    const targetSource = targetParagraph ? getParagraphAudioSource(targetParagraph) : null;
-    if (!targetParagraph || !targetSource) {
-      return;
-    }
-
-    const currentAudio = audioRef.current;
-    const wasPlaying =
-      forceResume ||
-      (playbackSourceRef.current === "timeline" && isTimelinePlaying) ||
-      (playbackSourceRef.current === "timeline" && currentAudio !== null && !currentAudio.paused);
-    const offsetInSegment = Math.max(0, clamped - targetSegment.start);
-
-    clearActiveAudio();
-
-    const audio = new Audio(targetSource.src);
-    const seekRequestId = seekRequestIdRef.current;
-    audioRef.current = audio;
-    currentAudioCleanupRef.current = targetSource.cleanup ?? null;
-    playbackSourceRef.current = "timeline";
-    setTimelineCurrentIndex(targetSegment.paragraphIndex);
-    setActiveParagraphId(targetParagraph.id);
-    setPlayingParagraphId(wasPlaying ? targetParagraph.id : null);
-    setIsTimelinePlaying(wasPlaying);
-
-    audio.onended = () => {
-      setPlayingParagraphId(null);
-      releaseCurrentAudioSource();
-
-      if (audioRef.current === audio) {
-        audioRef.current = null;
-      }
-
-      if (playbackSourceRef.current !== "timeline" || !timelinePlayingRef.current) {
-        return;
-      }
-
-      playTimelineFrom(targetSegment.paragraphIndex + 1);
-    };
-
-    audio.onerror = () => {
-      setPlayingParagraphId(null);
-      releaseCurrentAudioSource();
-
-      if (audioRef.current === audio) {
-        audioRef.current = null;
-      }
-    };
-
-    const applyOffset = (): void => {
-      const seekTarget = Math.max(0, Math.min(offsetInSegment, Math.max((audio.duration || 0) - 0.01, 0)));
-      if (!Number.isFinite(seekTarget)) {
-        return;
-      }
-
-      try {
-        audio.currentTime = seekTarget;
-      } catch {
-        // Ignore browser-level seek errors while metadata loads.
-      }
-    };
-
-    audio.onloadedmetadata = () => {
-      if (audioRef.current !== audio || seekRequestId !== seekRequestIdRef.current) {
-        return;
-      }
-
-      applyOffset();
-      if (wasPlaying) {
-        void audio.play().catch(() => {
-          setPlayingParagraphId(null);
-          setIsTimelinePlaying(false);
-        });
-      }
-    };
-
-    if (!wasPlaying) {
-      applyOffset();
-    }
-  };
-
-  const onTimelineScrubStart = (): void => {
-    isTimelineScrubbingRef.current = true;
-
-    const audio = audioRef.current;
-    const isTimelineAudioActive = playbackSourceRef.current === "timeline" && Boolean(audio);
-    const wasPlaying = isTimelineAudioActive && audio !== null && !audio.paused;
-
-    shouldResumeAfterSeekRef.current = wasPlaying;
-    if (wasPlaying && audio) {
-      audio.pause();
-      setPlayingParagraphId(null);
-      setIsTimelinePlaying(false);
-    }
-  };
-
-  const onTimelineScrubEnd = (): void => {
-    // Keep locked until onValueCommitted runs; fallback unlock below covers cancellations.
-    window.setTimeout(() => {
-      if (isTimelineScrubbingRef.current) {
-        isTimelineScrubbingRef.current = false;
-      }
-    }, 50);
-  };
-
-  const onTimelineToggle = (): void => {
-    if (isTimelinePlaying) {
-      if (playbackSourceRef.current === "timeline" && audioRef.current) {
-        audioRef.current.pause();
-      }
-      setPlayingParagraphId(null);
-      setIsTimelinePlaying(false);
-      return;
-    }
-
-    if (
-      playbackSourceRef.current === "timeline" &&
-      audioRef.current &&
-      audioRef.current.paused &&
-      timelineCurrentIndex !== null
-    ) {
-      const currentParagraph = paragraphsRef.current[timelineCurrentIndex];
-      setPlayingParagraphId(currentParagraph?.id ?? null);
-      setIsTimelinePlaying(true);
-      void audioRef.current.play().catch(() => {
-        setPlayingParagraphId(null);
-        setIsTimelinePlaying(false);
-      });
-      return;
-    }
-
-    const startIndex = timelineCurrentIndex ?? 0;
-    playTimelineFrom(startIndex);
-  };
-
-  const onParagraphPlaybackToggle = (item: ParagraphItem): void => {
-    if (!hasParagraphAudio(item)) {
-      return;
-    }
-
-    const selectedTimelineParagraph =
-      timelineCurrentIndex !== null ? paragraphsRef.current[timelineCurrentIndex] : null;
-    const isCurrentAudioItem =
-      selectedTimelineParagraph?.id === item.id &&
-      playbackSourceRef.current !== null &&
-      Boolean(audioRef.current);
-
-    if (isCurrentAudioItem && audioRef.current && !audioRef.current.paused) {
-      audioRef.current.pause();
-      setPlayingParagraphId(null);
-      if (playbackSourceRef.current === "timeline") {
-        setIsTimelinePlaying(false);
-      }
-      return;
-    }
-
-    if (isCurrentAudioItem && audioRef.current && audioRef.current.paused) {
-      setPlayingParagraphId(item.id);
-      if (playbackSourceRef.current === "timeline") {
-        setIsTimelinePlaying(true);
-      }
-      void audioRef.current.play().catch(() => {
-        setPlayingParagraphId(null);
-        if (playbackSourceRef.current === "timeline") {
-          setIsTimelinePlaying(false);
-        }
-      });
-      return;
-    }
-
-    onPlay(item);
-  };
-
-  const onPlay = (item: ParagraphItem): void => {
-    const source = getParagraphAudioSource(item);
-    if (!source) {
-      return;
-    }
-
-    const itemIndex = paragraphsRef.current.findIndex((paragraph) => paragraph.id === item.id);
-
-    clearActiveAudio();
-    playbackSourceRef.current = "manual";
-    setIsTimelinePlaying(false);
-    setTimelineCurrentIndex(itemIndex >= 0 ? itemIndex : null);
-    if (itemIndex >= 0) {
-      const segment = timelineSegmentByParagraphIndex.get(itemIndex);
-      setTimelinePositionSec(segment?.start ?? 0);
-    }
-
-    const audio = new Audio(source.src);
-    audioRef.current = audio;
-    currentAudioCleanupRef.current = source.cleanup ?? null;
-    setActiveParagraphId(item.id);
-    setPlayingParagraphId(item.id);
-
-    audio.onended = () => {
-      setPlayingParagraphId(null);
-      releaseCurrentAudioSource();
-
-      if (audioRef.current === audio) {
-        audioRef.current = null;
-      }
-    };
-
-    audio.onerror = () => {
-      setPlayingParagraphId(null);
-      releaseCurrentAudioSource();
-    };
-
-    void audio.play().catch(() => {
-      setPlayingParagraphId(null);
-    });
-  };
-
   const onExportWav = async (): Promise<void> => {
     if (!canExport) {
       return;
@@ -1869,53 +856,7 @@ function App() {
     setGlobalError(null);
 
     try {
-      const prepared: Blob[] = [];
-      for (const item of paragraphsRef.current) {
-        if (item.status !== "ok") {
-          continue;
-        }
-
-        if (item.audioBlob) {
-          prepared.push(item.audioBlob);
-          continue;
-        }
-
-        if (item.audioUrl) {
-          prepared.push(await fetchAudioViaProxy(item.audioUrl));
-        }
-      }
-
-      const audioContext = new AudioContext();
-      const decoded = await Promise.all(
-        prepared.map(async (blob) => audioContext.decodeAudioData(await blob.arrayBuffer())),
-      );
-
-      if (decoded.length === 0) {
-        throw new Error("No audio clips available to export.");
-      }
-
-      const targetRate = decoded[0].sampleRate;
-      const normalized = await Promise.all(decoded.map((buffer) => resampleBuffer(buffer, targetRate)));
-      const channels = Math.max(...normalized.map((buffer) => buffer.numberOfChannels));
-      const totalFrames = normalized.reduce((sum, buffer) => sum + buffer.length, 0);
-      const merged = audioContext.createBuffer(channels, totalFrames, targetRate);
-
-      let writeOffset = 0;
-      for (const buffer of normalized) {
-        for (let channel = 0; channel < channels; channel += 1) {
-          const targetChannel = merged.getChannelData(channel);
-          const sourceChannel =
-            channel < buffer.numberOfChannels
-              ? buffer.getChannelData(channel)
-              : buffer.getChannelData(buffer.numberOfChannels - 1);
-          targetChannel.set(sourceChannel, writeOffset);
-        }
-        writeOffset += buffer.length;
-      }
-
-      const wavBlob = encodeWav(merged);
-      downloadBlob(wavBlob, "voicestudio-export.wav");
-      await audioContext.close();
+      await exportWav(paragraphsRef.current);
     } catch (error) {
       setGlobalError(error instanceof Error ? error.message : "Error exporting final audio.");
     } finally {
@@ -1933,127 +874,15 @@ function App() {
     setExportingKind("premiere");
     setGlobalError(null);
 
-    const audioContext = new AudioContext();
-
     try {
-      const zip = new JSZip();
-      const audioFolder = zip.folder("audio");
-      if (!audioFolder) {
-        throw new Error("Unable to create audio folder for export.");
-      }
-
-      const pauseFrames = Math.round(PREMIERE_XML_PAUSE_SECONDS * PREMIERE_XML_FPS);
-      let timelineCursor = 0;
-      const clips: PremiereExportClip[] = [];
-
-      const okParagraphs = paragraphsRef.current.filter(
-        (item) => item.status === "ok" && hasParagraphAudio(item),
-      );
-
-      for (const [index, item] of okParagraphs.entries()) {
-        const sourceBlob = item.audioBlob ?? (item.audioUrl ? await fetchAudioViaProxy(item.audioUrl) : null);
-        if (!sourceBlob) {
-          continue;
-        }
-
-        const decoded = await audioContext.decodeAudioData(await sourceBlob.arrayBuffer());
-        const resampled = await resampleBuffer(decoded, PREMIERE_AUDIO_SAMPLE_RATE);
-        const normalized = ensureChannelCount(resampled, 2, audioContext);
-        const wavBlob = encodeWav(normalized);
-        const clipNumber = (index + 1).toString().padStart(3, "0");
-        const fileName = `clip_${clipNumber}.wav`;
-        audioFolder.file(fileName, wavBlob);
-
-        const durationFrames = secondsToTimelineFrames(normalized.duration);
-        const speaker = models.find((model) => model.id === item.speakerModelId);
-        const clip: PremiereExportClip = {
-          name: `Clip ${clipNumber}`,
-          fileName,
-          pathUrl: `audio/${fileName}`,
-          text: item.text,
-          speakerName: speaker?.name ?? "Unknown",
-          durationSeconds: normalized.duration,
-          durationFrames,
-          startFrame: timelineCursor,
-          endFrame: timelineCursor + durationFrames,
-        };
-
-        clips.push(clip);
-        timelineCursor = clip.endFrame + pauseFrames;
-      }
-
-      if (clips.length === 0) {
-        throw new Error("No audio clips available to export.");
-      }
-
-      const sequenceName = activeProjectName.trim() || "VoiceStudio Export";
-      const xml = buildPremiereXml(clips, sequenceName);
-      const manifest = {
-        app: "VoiceStudio",
-        format: "premiere-xmeml-package",
-        generatedAt: new Date().toISOString(),
-        sequenceName,
-        xmlFile: "timeline.xml",
-        audioFolder: "audio",
-        timeline: {
-          fps: PREMIERE_XML_FPS,
-          pauseSeconds: PREMIERE_XML_PAUSE_SECONDS,
-          audioSampleRate: PREMIERE_AUDIO_SAMPLE_RATE,
-        },
-        clips: clips.map((clip, index) => ({
-          index: index + 1,
-          fileName: `audio/${clip.fileName}`,
-          speakerName: clip.speakerName,
-          text: clip.text,
-          durationSeconds: clip.durationSeconds,
-          startSeconds: clip.startFrame / PREMIERE_XML_FPS,
-          endSeconds: clip.endFrame / PREMIERE_XML_FPS,
-        })),
-      };
-
-      zip.file("timeline.xml", xml);
-      zip.file("manifest.json", JSON.stringify(manifest, null, 2));
-      zip.file(
-        "fix-premiere-paths.ps1",
-        [
-          "$ErrorActionPreference = 'Stop'",
-          "$packageDir = Split-Path -Parent $MyInvocation.MyCommand.Path",
-          "$inputXml = Join-Path $packageDir 'timeline.xml'",
-          "$outputXml = Join-Path $packageDir 'timeline-premiere-fixed.xml'",
-          "$content = Get-Content -LiteralPath $inputXml -Raw",
-          "$content = [regex]::Replace($content, '<pathurl>audio/(clip_\\d+\\.wav)</pathurl>', {",
-          "  param($match)",
-          "  $wavPath = Join-Path (Join-Path $packageDir 'audio') $match.Groups[1].Value",
-          "  $uri = [Uri]::new($wavPath).AbsoluteUri",
-          "  \"<pathurl>$uri</pathurl>\"",
-          "})",
-          "Set-Content -LiteralPath $outputXml -Value $content -Encoding UTF8",
-          "Write-Host \"Created $outputXml\"",
-        ].join("\n"),
-      );
-      zip.file(
-        "README.txt",
-        [
-          "VoiceStudio Premiere package",
-          "",
-          "1. Extract this ZIP before importing.",
-          "2. On Windows, right-click fix-premiere-paths.ps1 and run it with PowerShell.",
-          "3. In Adobe Premiere Pro, import timeline-premiere-fixed.xml.",
-          "4. If Premiere asks to locate media, choose the matching files inside the audio folder.",
-          "",
-          "timeline.xml uses portable relative paths. The PowerShell helper rewrites them",
-          "to absolute file URLs, which Premiere imports more reliably on Windows.",
-          "",
-          `Timeline pause between clips: ${PREMIERE_XML_PAUSE_SECONDS}s.`,
-        ].join("\n"),
-      );
-
-      const zipBlob = await zip.generateAsync({ type: "blob" });
-      downloadBlob(zipBlob, "voicestudio-premiere-package.zip");
+      await exportPremierePackage({
+        activeProjectName,
+        models,
+        paragraphs: paragraphsRef.current,
+      });
     } catch (error) {
       setGlobalError(error instanceof Error ? error.message : "Error exporting Premiere package.");
     } finally {
-      await audioContext.close();
       setIsExporting(false);
       setExportingKind(null);
     }
