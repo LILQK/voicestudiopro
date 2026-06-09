@@ -17,3 +17,11 @@ def get_audio(job_id: str, file_name: str) -> FileResponse:
         raise NotFoundError("Audio file not found.")
     return FileResponse(path, media_type="audio/wav", filename=file_name)
 
+
+@router.delete("/{job_id}/{file_name}")
+def delete_audio(job_id: str, file_name: str) -> dict:
+    path = renders_dir() / job_id / file_name
+    if not path.exists():
+        raise NotFoundError("Audio file not found.")
+    path.unlink()
+    return {"ok": True}
