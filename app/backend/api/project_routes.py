@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 from app.backend.storage.json_store import project_store
 from app.backend.storage.schemas import Project
@@ -34,3 +34,8 @@ def save_project(project_id: str, project: Project) -> Project:
     project.id = project_id
     return project_store.save(project)
 
+
+@router.delete("/{project_id}", status_code=204)
+def delete_project(project_id: str) -> Response:
+    project_store.delete(project_id)
+    return Response(status_code=204)

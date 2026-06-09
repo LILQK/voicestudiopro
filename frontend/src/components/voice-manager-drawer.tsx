@@ -251,23 +251,23 @@ export function VoiceManagerDrawer({
   };
 
   const onRenameStart = (voice: VoicePreset): void => {
-    setEditingVoiceName(voice.name);
+    setEditingVoiceName(voice.id);
     setEditingTargetName(voice.name.replace(/\.[^.]+$/, ""));
     setManagerError(null);
   };
 
-  const onRenameSave = async (voiceNameToRename: string): Promise<void> => {
+  const onRenameSave = async (voiceIdToRename: string): Promise<void> => {
     const trimmed = editingTargetName.trim();
     if (!trimmed) {
       setManagerError("New name is required.");
       return;
     }
 
-    setBusyVoiceName(voiceNameToRename);
+    setBusyVoiceName(voiceIdToRename);
     setManagerError(null);
 
     try {
-      await onRename(voiceNameToRename, trimmed);
+      await onRename(voiceIdToRename, trimmed);
       await onRefresh();
       setEditingVoiceName(null);
       setEditingTargetName("");
@@ -278,19 +278,19 @@ export function VoiceManagerDrawer({
     }
   };
 
-  const onDeleteClick = async (voiceNameToDelete: string): Promise<void> => {
+  const onDeleteClick = async (voiceIdToDelete: string, voiceNameToDelete: string): Promise<void> => {
     const confirmed = window.confirm(`Delete voice preset \"${voiceNameToDelete}\"?`);
     if (!confirmed) {
       return;
     }
 
-    setBusyVoiceName(voiceNameToDelete);
+    setBusyVoiceName(voiceIdToDelete);
     setManagerError(null);
 
     try {
-      await onDelete(voiceNameToDelete);
+      await onDelete(voiceIdToDelete);
       await onRefresh();
-      if (editingVoiceName === voiceNameToDelete) {
+      if (editingVoiceName === voiceIdToDelete) {
         setEditingVoiceName(null);
         setEditingTargetName("");
       }
@@ -377,13 +377,13 @@ export function VoiceManagerDrawer({
                   <p className="text-sm text-muted-foreground">No voice presets found.</p>
                 ) : (
                   filteredVoices.map((voice) => {
-                    const isEditing = editingVoiceName === voice.name;
-                    const isBusy = busyVoiceName === voice.name;
-                    const isSelected = selectedVoiceModelId === `preset:${voice.name}`;
+                    const isEditing = editingVoiceName === voice.id;
+                    const isBusy = busyVoiceName === voice.id;
+                    const isSelected = selectedVoiceModelId === `preset:${voice.id}`;
 
                     return (
                       <article
-                        key={voice.name}
+                        key={voice.id}
                         className={cn(
                           "rounded-lg border border-border bg-muted/40 p-3 transition-colors transition-shadow",
                           !isEditing ? "hover:border-primary/50 hover:bg-accent/40 hover:shadow-sm" : "",
@@ -396,7 +396,7 @@ export function VoiceManagerDrawer({
                               type="button"
                               className="w-full cursor-pointer rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                               onClick={() => {
-                                onSelectVoicePreset(voice.name);
+                                onSelectVoicePreset(voice.id);
                                 onClose();
                               }}
                             >
@@ -419,7 +419,7 @@ export function VoiceManagerDrawer({
                                 size="sm"
                                 variant="ghost"
                                 disabled={isBusy}
-                                onClick={() => void onDeleteClick(voice.name)}
+                                onClick={() => void onDeleteClick(voice.id, voice.name)}
                               >
                                 <Trash2 />
                                 Delete
@@ -438,7 +438,7 @@ export function VoiceManagerDrawer({
                                 type="button"
                                 size="sm"
                                 disabled={isBusy}
-                                onClick={() => void onRenameSave(voice.name)}
+                                onClick={() => void onRenameSave(voice.id)}
                               >
                                 {isBusy ? <RotateCw className="animate-spin" /> : <Pencil />}
                                 Save

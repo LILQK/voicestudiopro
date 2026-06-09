@@ -1,47 +1,29 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import JSZip from "jszip";
-import {
-  ChevronDown,
-  ChevronRight,
-  MoreHorizontal,
-  Download,
-  Loader2,
-  Pause,
-  Play,
-  Plus,
-  RefreshCcw,
-  Square,
-} from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuTrigger,
-  DropdownMenuItem,
-} from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { SpeakerAvatar } from "@/components/ui/speaker-avatar";
-import { Slider } from "@/components/ui/slider";
-import { Textarea } from "@/components/ui/textarea";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { VoiceManagerDrawer } from "@/components/voice-manager-drawer";
+import { ExportMenu } from "@/features/export/ExportMenu";
+import { ProjectsPanel, type DisplayProjectItem } from "@/features/projects/ProjectsPanel";
+import { ScriptWorkspace } from "@/features/studio/ScriptWorkspace";
+import { TimelineFooter } from "@/features/studio/TimelineFooter";
+import type {
+  ExportKind,
+  GenerationStatus,
+  ModelItem,
+  ParagraphItem,
+  ParagraphStatus,
+  ProjectHistoryItem,
+} from "@/features/studio/types";
+import { VoiceRuntimePanel } from "@/features/studio/VoiceRuntimePanel";
+import { useGenerationQueue } from "@/features/studio/useGenerationQueue";
 import {
   buildAudioProxyUrl,
   createVoicePreset,
   deleteGeneratedAudioViaProxy,
   deleteVoicePreset,
-  extractGeneratedAudioUrl,
   fetchAudioViaProxy,
   getQwenStatus,
   getVoicePresets,
-  loadPromptAndGen,
   renameVoicePreset as renameVoicePresetApi,
   type QwenState,
   type VoicePreset,
@@ -56,38 +38,6 @@ import {
   type StoredParagraphStatus,
   type StoredProject,
 } from "@/lib/projectsStore";
-type ModelItem = {
-  id: string;
-  name: string;
-  size: number;
-  source: "preset" | "uploaded";
-  file?: File;
-  presetName?: string;
-};
-
-type ParagraphStatus = "pending" | "generating" | "ok" | "error";
-
-type ParagraphItem = {
-  id: string;
-  text: string;
-  speakerModelId: string;
-  speakerOverridden: boolean;
-  status: ParagraphStatus;
-  audioUrl?: string;
-  audioBlob?: Blob;
-  error?: string;
-};
-
-type GenerationStatus = "idle" | "running" | "completed" | "partial_error";
-type ExportKind = "wav" | "premiere";
-type ProjectHistoryItem = {
-  id: string;
-  name: string;
-  createdAt: number;
-  updatedAt: number;
-};
-type DisplayProjectItem = ProjectHistoryItem & { isTransient?: boolean };
-
 const MAX_SEGMENT_CHARACTERS = 320;
 const ACCEPTED_MODEL_EXTENSIONS = new Set([".pt", ".pth", ".bin"]);
 const PRESET_MODEL_ID_PREFIX = "preset:";
@@ -128,13 +78,13 @@ const buildProjectName = (timestampMs: number): string => {
   return `Project ${date.getFullYear()}-${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())} ${twoDigits(date.getHours())}:${twoDigits(date.getMinutes())}`;
 };
 
-const buildPresetModelItems = (presets: { name: string; size: number }[]): ModelItem[] =>
+const buildPresetModelItems = (presets: { id: string; name: string; size: number }[]): ModelItem[] =>
   presets.map((preset) => ({
-    id: `${PRESET_MODEL_ID_PREFIX}${preset.name}`,
+    id: `${PRESET_MODEL_ID_PREFIX}${preset.id}`,
     name: preset.name,
     size: preset.size,
     source: "preset",
-    presetName: preset.name,
+    presetName: preset.id,
   }));
 
 const splitOversizedBlock = (block: string, maxChars: number): string[] => {
@@ -225,13 +175,6 @@ const reconcileParagraphsFromTexts = (
 const areParagraphTextsEqual = (paragraphs: ParagraphItem[], texts: string[]): boolean =>
   paragraphs.length === texts.length &&
   paragraphs.every((paragraph, index) => paragraph.text === texts[index]);
-
-const paragraphStripClass: Record<ParagraphStatus, string> = {
-  pending: "bg-muted-foreground/35",
-  generating: "bg-muted-foreground/55",
-  ok: "bg-blue-500",
-  error: "bg-destructive",
-};
 
 const buildGenerationStatus = (paragraphs: ParagraphItem[]): GenerationStatus => {
   if (paragraphs.some((paragraph) => paragraph.status === "generating")) {
@@ -627,8 +570,6 @@ function App() {
   const [timelineCurrentIndex, setTimelineCurrentIndex] = useState<number | null>(null);
   const [isVoiceManagerOpen, setIsVoiceManagerOpen] = useState(false);
 
-  const runIdRef = useRef(0);
-  const generationAbortControllerRef = useRef<AbortController | null>(null);
   const paragraphsRef = useRef<ParagraphItem[]>([]);
   const paragraphTextareaRefsRef = useRef<Map<string, HTMLTextAreaElement>>(new Map());
   const pendingParagraphFocusIdRef = useRef<string | null>(null);
@@ -722,7 +663,7 @@ function App() {
         if (!active) {
           return;
         }
-        setGlobalError("Unable to read project history from local storage.");
+        setGlobalError("Unable to read project history from backend.");
       })
       .finally(() => {
         if (active) {
@@ -795,43 +736,6 @@ function App() {
   useEffect(() => {
     let active = true;
 
-    const loadStatus = async (): Promise<void> => {
-      try {
-        const next = await getQwenStatus();
-        if (active) {
-          setQwenState(next);
-        }
-      } catch {
-        if (active) {
-          setQwenState({
-            status: "error",
-            launchedByApp: false,
-            attempts: 0,
-            startupElapsedMs: 0,
-            apiUrl: "http://127.0.0.1:8000",
-            lastError: "Could not connect to the local backend",
-          });
-        }
-      }
-    };
-
-    void loadStatus();
-    const interval = setInterval(() => {
-      void loadStatus();
-    }, 1500);
-
-    return () => {
-      active = false;
-      clearInterval(interval);
-      generationAbortControllerRef.current?.abort();
-      generationAbortControllerRef.current = null;
-      clearActiveAudio();
-    };
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-
     const loadDefaultVoices = async (): Promise<void> => {
       try {
         const presets = await getVoicePresets();
@@ -893,6 +797,62 @@ function App() {
         .map((paragraph) => paragraph.id),
     [paragraphs, selectedParagraphIdSet],
   );
+  const {
+    abortGeneration,
+    cancelGeneration: onCancelGeneration,
+    generateAll: onGenerateAll,
+    generateFromParagraph: onGenerateFromParagraph,
+    generateSelectedParagraphs: onGenerateSelectedParagraphs,
+    retryParagraph: onRetryParagraph,
+  } = useGenerationQueue({
+    generationStatus,
+    isQwenReady,
+    models,
+    orderedSelectedParagraphIds,
+    paragraphsRef,
+    selectedModel,
+    setGenerationStatus,
+    setGlobalError,
+    setParagraphDurations,
+    setParagraphs,
+    setSelectedParagraphIds,
+  });
+
+  useEffect(() => {
+    let active = true;
+
+    const loadStatus = async (): Promise<void> => {
+      try {
+        const next = await getQwenStatus();
+        if (active) {
+          setQwenState(next);
+        }
+      } catch {
+        if (active) {
+          setQwenState({
+            status: "error",
+            launchedByApp: false,
+            attempts: 0,
+            startupElapsedMs: 0,
+            apiUrl: "http://127.0.0.1:8000",
+            lastError: "Could not connect to the local backend",
+          });
+        }
+      }
+    };
+
+    void loadStatus();
+    const interval = setInterval(() => {
+      void loadStatus();
+    }, 1500);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+      abortGeneration();
+      clearActiveAudio();
+    };
+  }, [abortGeneration]);
 
   useEffect(() => {
     if (models.length === 0) {
@@ -979,7 +939,7 @@ function App() {
         })
         .catch(() => {
           if (!cancelled) {
-            setGlobalError("Unable to save project session to local storage.");
+            setGlobalError("Unable to save project session to backend.");
           }
         });
     }, 500);
@@ -1313,232 +1273,6 @@ function App() {
     await deleteVoicePreset(voiceName);
   };
 
-  const updateParagraph = (id: string, updater: (item: ParagraphItem) => ParagraphItem): void => {
-    setParagraphs((previous) => previous.map((item) => (item.id === id ? updater(item) : item)));
-  };
-
-  const generateSingleParagraph = async (
-    id: string,
-    runId: number,
-    signal?: AbortSignal,
-  ): Promise<boolean> => {
-    const target = paragraphsRef.current.find((item) => item.id === id);
-    if (!target) {
-      return false;
-    }
-
-    const assignedModel = models.find((item) => item.id === target.speakerModelId);
-    const activeModel = assignedModel ?? selectedModel;
-
-    if (!activeModel) {
-      updateParagraph(id, (item) => ({
-        ...item,
-        status: "error",
-        error: "No valid voice model is available for this paragraph.",
-      }));
-      return false;
-    }
-
-    if (!assignedModel && target.speakerModelId) {
-      updateParagraph(id, (item) => ({
-        ...item,
-        speakerModelId: activeModel.id,
-        speakerOverridden: false,
-      }));
-    }
-
-    if (!target.text.trim()) {
-      updateParagraph(id, (item) => ({
-        ...item,
-        status: "error",
-        error: "This paragraph is empty.",
-      }));
-      return false;
-    }
-
-    updateParagraph(id, (item) => ({
-      ...item,
-      status: "generating",
-      audioUrl: undefined,
-      audioBlob: undefined,
-      error: undefined,
-    }));
-    setParagraphDurations((previous) => {
-      if (!(id in previous)) {
-        return previous;
-      }
-      const next = { ...previous };
-      delete next[id];
-      return next;
-    });
-
-    try {
-      const formData = new FormData();
-      formData.append("text", target.text);
-      if (activeModel.source === "preset" && activeModel.presetName) {
-        formData.append("voicePreset", activeModel.presetName);
-      } else if (activeModel.file) {
-        formData.append("audio", activeModel.file);
-      } else {
-        throw new Error("Selected voice model is invalid.");
-      }
-
-      const result = await loadPromptAndGen(formData, { signal });
-      const audioUrl = extractGeneratedAudioUrl(result);
-
-      if (!audioUrl) {
-        throw new Error("No audio URL found in Qwen response.");
-      }
-
-      if (runId !== runIdRef.current) {
-        return false;
-      }
-
-      updateParagraph(id, (item) => ({
-        ...item,
-        status: "ok",
-        audioUrl,
-        audioBlob: undefined,
-        error: undefined,
-      }));
-
-      return true;
-    } catch (error) {
-      if (runId !== runIdRef.current) {
-        return false;
-      }
-
-      updateParagraph(id, (item) => ({
-        ...item,
-        status: "error",
-        audioUrl: undefined,
-        audioBlob: undefined,
-        error: error instanceof Error ? error.message : "Unknown error while generating audio.",
-      }));
-      return false;
-    }
-  };
-
-  const runQueue = async (ids: string[]): Promise<void> => {
-    const runId = Date.now();
-    const abortController = new AbortController();
-    runIdRef.current = runId;
-    generationAbortControllerRef.current = abortController;
-    setGlobalError(null);
-    setGenerationStatus("running");
-
-    let failed = false;
-
-    try {
-      for (const id of ids) {
-        if (runId !== runIdRef.current || abortController.signal.aborted) {
-          break;
-        }
-
-        const success = await generateSingleParagraph(id, runId, abortController.signal);
-        if (runId !== runIdRef.current || abortController.signal.aborted) {
-          break;
-        }
-
-        if (!success) {
-          failed = true;
-        }
-      }
-
-      if (runId !== runIdRef.current || abortController.signal.aborted) {
-        return;
-      }
-
-      setGenerationStatus(failed ? "partial_error" : "completed");
-    } finally {
-      if (generationAbortControllerRef.current === abortController) {
-        generationAbortControllerRef.current = null;
-      }
-    }
-  };
-
-  const onCancelGeneration = (): void => {
-    runIdRef.current = Date.now();
-    generationAbortControllerRef.current?.abort();
-    generationAbortControllerRef.current = null;
-    setParagraphs((previous) => {
-      const next = previous.map((paragraph) => recoverInterruptedParagraph(paragraph, "cancelled"));
-      setGenerationStatus(buildGenerationStatus(next));
-      return next;
-    });
-  };
-
-  const generateParagraphBatch = async (ids: string[]): Promise<void> => {
-    if (ids.length === 0 || generationStatus === "running") {
-      return;
-    }
-    if (!selectedModel) {
-      setGlobalError("No model selected. Choose a voice preset to process.");
-      return;
-    }
-    if (!isQwenReady) {
-      setGlobalError("Qwen is not ready yet. Please wait a moment and try again.");
-      return;
-    }
-
-    setSelectedParagraphIds(ids);
-    await runQueue(ids);
-  };
-
-  const onGenerateAll = async (): Promise<void> => {
-    if (!canGenerate) {
-      return;
-    }
-
-    const ids = paragraphsRef.current
-      .filter((item) => item.text.trim().length > 0)
-      .map((item) => item.id);
-    await generateParagraphBatch(ids);
-  };
-
-  const onGenerateFromParagraph = async (paragraphId: string): Promise<void> => {
-    const startIndex = paragraphsRef.current.findIndex((item) => item.id === paragraphId);
-    if (startIndex < 0) {
-      return;
-    }
-
-    const ids = paragraphsRef.current
-      .slice(startIndex)
-      .filter((item) => item.text.trim().length > 0)
-      .map((item) => item.id);
-    await generateParagraphBatch(ids);
-  };
-
-  const onGenerateSelectedParagraphs = async (): Promise<void> => {
-    const selectedNonEmptyIds = paragraphsRef.current
-      .filter((item) => orderedSelectedParagraphIds.includes(item.id) && item.text.trim().length > 0)
-      .map((item) => item.id);
-    await generateParagraphBatch(selectedNonEmptyIds);
-  };
-
-  const onRetryParagraph = async (id: string): Promise<void> => {
-    if (!selectedModel || generationStatus === "running") {
-      return;
-    }
-
-    const runId = Date.now();
-    const abortController = new AbortController();
-    runIdRef.current = runId;
-    generationAbortControllerRef.current = abortController;
-    setGenerationStatus("running");
-
-    try {
-      await generateSingleParagraph(id, runId, abortController.signal);
-      if (runId === runIdRef.current && !abortController.signal.aborted) {
-        setGenerationStatus(buildGenerationStatus(paragraphsRef.current));
-      }
-    } finally {
-      if (generationAbortControllerRef.current === abortController) {
-        generationAbortControllerRef.current = null;
-      }
-    }
-  };
-
   const onParagraphTextChange = (id: string, text: string): void => {
     const paragraphIndex = paragraphsRef.current.findIndex((item) => item.id === id);
     if (text.endsWith("\n") && paragraphIndex >= 0) {
@@ -1667,9 +1401,7 @@ function App() {
 
   const onCreateNewProject = (): void => {
     const timestamp = Date.now();
-    generationAbortControllerRef.current?.abort();
-    generationAbortControllerRef.current = null;
-    runIdRef.current = timestamp;
+    abortGeneration();
     resetSessionPlaybackState();
     setGlobalError(null);
     setInputText("");
@@ -1690,9 +1422,7 @@ function App() {
         return;
       }
 
-      generationAbortControllerRef.current?.abort();
-      generationAbortControllerRef.current = null;
-      runIdRef.current = Date.now();
+      abortGeneration();
       resetSessionPlaybackState();
       hydratingProjectRef.current = true;
 
@@ -2339,168 +2069,42 @@ function App() {
               <h1 className="mt-1 text-xl font-semibold">TTS Editor</h1>
             </div>
 
-            <Card className="gap-0">
-              <CardHeader className="pb-1">
-                <div className="flex items-center justify-between gap-2">
-                  <CardTitle className="text-sm">Projects</CardTitle>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={onCreateNewProject}
-                    aria-label="Create new project"
-                  >
-                    <Plus />
-                  </Button>
-                </div>
-              </CardHeader>
-              <CardContent className="pt-0">
-                <div className="space-y-1">
-                  {!isProjectsReady ? (
-                    <p className="text-xs text-muted-foreground">Loading project history...</p>
-                  ) : sidebarProjects.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">No saved projects yet.</p>
-                  ) : (
-                    sidebarProjects.map((project) => (
-                      <div
-                        key={project.id}
-                        className="group/item flex items-center gap-1 transition-colors hover:bg-muted/50"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => void onOpenProject(project.id)}
-                          className="min-w-0 flex-1 py-1.5 text-left"
-                        >
-                          {editingProjectId === project.id ? (
-                            <Input
-                              value={editingProjectName}
-                              autoFocus
-                              className="h-8"
-                              onClick={(event) => event.stopPropagation()}
-                              onChange={(event) => setEditingProjectName(event.target.value)}
-                              onBlur={() => void onCommitProjectRename(project.id)}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  void onCommitProjectRename(project.id);
-                                }
-                                if (event.key === "Escape") {
-                                  setEditingProjectId(null);
-                                  setEditingProjectName("");
-                                }
-                              }}
-                            />
-                          ) : (
-                            <p
-                              className={`line-clamp-1 text-sm ${
-                                project.id === activeProjectId
-                                  ? "inline-block -ml-2 rounded-md bg-muted px-2 py-0.5 font-semibold text-foreground"
-                                  : "font-normal text-foreground/85"
-                              }`}
-                            >
-                              {project.name}
-                            </p>
-                          )}
-                        </button>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="mr-1 size-7 shrink-0 opacity-0 transition-opacity group-hover/item:opacity-100 group-focus-within/item:opacity-100"
-                              aria-label={`Project actions for ${project.name}`}
-                            >
-                              <MoreHorizontal />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="w-40">
-                            <DropdownMenuItem onSelect={() => onRenameProject(project.id)}>
-                              Rename
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              className="text-destructive focus:text-destructive"
-                              onSelect={() => void onDeleteProject(project.id)}
-                            >
-                              Delete
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </CardContent>
-            </Card>
+            <ProjectsPanel
+              projects={sidebarProjects}
+              activeProjectId={activeProjectId}
+              editingProjectId={editingProjectId}
+              editingProjectName={editingProjectName}
+              isReady={isProjectsReady}
+              onCreateProject={onCreateNewProject}
+              onOpenProject={(projectId) => void onOpenProject(projectId)}
+              onRenameProject={onRenameProject}
+              onCommitProjectRename={(projectId) => void onCommitProjectRename(projectId)}
+              onDeleteProject={(projectId) => void onDeleteProject(projectId)}
+              onEditingProjectNameChange={setEditingProjectName}
+              onCancelRename={() => {
+                setEditingProjectId(null);
+                setEditingProjectName("");
+              }}
+            />
 
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="text-sm">Audio model</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="w-full justify-between font-normal"
-                  onClick={() => setIsVoiceManagerOpen(true)}
-                >
-                  <span className="truncate">{selectedModel?.name ?? "Select voice model"}</span>
-                  <ChevronRight className="size-4 text-muted-foreground" />
-                </Button>
-                {selectedModel ? (
-                  <div className="rounded-md border border-border/80 bg-muted/60 p-2 text-xs">
-                    <p className="font-medium">Active: {selectedModel.name}</p>
-                    <p className="text-muted-foreground">
-                      {formatBytes(selectedModel.size)} ·{" "}
-                      {selectedModel.source === "preset" ? "Preset" : "Uploaded"}
-                    </p>
-                  </div>
-                ) : (
-                  <p className="text-xs text-muted-foreground">
-                    No voices found in `/voices`. Open the voice panel to create one.
-                  </p>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="text-sm">Qwen status</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-xs">
-                <div className="flex items-center justify-between">
-                  <span>Status</span>
-                  <Badge variant={qwenState?.status === "ready" ? "default" : "secondary"}>
-                    {qwenState?.status ?? "loading"}
-                  </Badge>
-                </div>
-                <p className="text-muted-foreground">{qwenState?.apiUrl ?? "http://127.0.0.1:8000"}</p>
-                {qwenState?.lastError ? <p className="text-destructive">{qwenState.lastError}</p> : null}
-              </CardContent>
-            </Card>
+            <VoiceRuntimePanel
+              selectedModel={selectedModel}
+              qwenState={qwenState}
+              formatBytes={formatBytes}
+              onOpenVoiceManager={() => setIsVoiceManagerOpen(true)}
+            />
           </div>
         </aside>
 
         <section className="flex min-h-screen flex-col">
           <header className="sticky top-0 z-20 flex items-center justify-end border-b border-border/80 bg-background/95 px-4 py-3 backdrop-blur md:px-6">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button disabled={!canExport}>
-                  {isExporting ? <Loader2 className="animate-spin" /> : <Download />}
-                  {exportingKind === "premiere" ? "Exporting package" : exportingKind === "wav" ? "Exporting WAV" : "Export"}
-                  <ChevronDown className="size-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-64">
-                <DropdownMenuLabel className="text-xs text-muted-foreground">Export options</DropdownMenuLabel>
-                <DropdownMenuItem onSelect={() => void onExportWav()}>
-                  WAV final mix
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => void onExportPremierePackage()}>
-                  Premiere XML + audio clips ZIP
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <ExportMenu
+              canExport={canExport}
+              exportingKind={exportingKind}
+              isExporting={isExporting}
+              onExportWav={() => void onExportWav()}
+              onExportPremierePackage={() => void onExportPremierePackage()}
+            />
           </header>
 
           <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-4 px-4 py-5 pb-28 md:px-6">
@@ -2511,254 +2115,52 @@ function App() {
               </Alert>
             ) : null}
 
-            <div className="space-y-3 border-0">
-                <div className="flex justify-center gap-2">
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span className="inline-flex">
-                        <Button onClick={() => void onGenerateAll()} disabled={!canGenerate}>
-                          {generationStatus === "running" ? <Loader2 className="animate-spin" /> : <Play />}
-                          Process
-                        </Button>
-                      </span>
-                    </TooltipTrigger>
-                    {!selectedModel ? (
-                      <TooltipContent>No model selected. Choose a voice preset to process.</TooltipContent>
-                    ) : null}
-                  </Tooltip>
-                  {generationStatus === "running" ? (
-                    <Button type="button" variant="destructive" onClick={onCancelGeneration}>
-                      <Square />
-                      Cancel
-                    </Button>
-                  ) : null}
-                </div>
-
-                <div>
-                  {paragraphs.length === 0 ? (
-                    <Textarea
-                      className="min-h-56 resize-none border-0 bg-transparent px-0 shadow-none outline-none focus-visible:ring-0"
-                      placeholder="Start typing or paste text here... paragraphs appear as you write."
-                      value={inputText}
-                      onChange={(event) => applyInputText(event.target.value)}
-                      disabled={generationStatus === "running"}
-                    />
-                  ) : (
-                    <div className="pr-1">
-                      {paragraphs.map((item) => {
-                        const isSelected = selectedParagraphIdSet.has(item.id);
-                        const hasMultiSelectionContext = isSelected && orderedSelectedParagraphIds.length > 1;
-
-                        return (
-                        <Popover
-                          key={item.id}
-                          open={activeParagraphId === item.id}
-                          onOpenChange={(open: boolean) => {
-                            if (open) {
-                              setActiveParagraphId(item.id);
-                            } else if (activeParagraphId === item.id) {
-                              setActiveParagraphId(null);
-                            }
-                          }}
-                        >
-                          <article
-                            className={`relative py-1.5 pl-4 pr-1 ${
-                              hasMultiSelectionContext
-                                ? "rounded-md border border-sky-300/70 bg-sky-100/70"
-                                : isSelected
-                                  ? "rounded-md bg-muted/40"
-                                  : ""
-                            }`}
-                            onContextMenu={(event) => onParagraphContextMenu(item.id, event)}
-                          >
-                            <PopoverTrigger asChild>
-                              <button
-                                type="button"
-                                aria-hidden
-                                tabIndex={-1}
-                                className="pointer-events-none absolute right-4 top-3 h-0 w-0 opacity-0"
-                              />
-                            </PopoverTrigger>
-                            <PopoverContent side="top" align="end" className="w-auto">
-                              {hasMultiSelectionContext ? (
-                                <div className="space-y-2">
-                                  <p className="text-xs text-muted-foreground">
-                                    {orderedSelectedParagraphIds.length} paragraphs selected
-                                  </p>
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    disabled={generationStatus === "running" || !selectedModel}
-                                    onClick={() => void onGenerateSelectedParagraphs()}
-                                  >
-                                    <RefreshCcw />
-                                    Regenerate selection
-                                  </Button>
-                                </div>
-                              ) : (
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    disabled={!hasParagraphAudio(item)}
-                                    onClick={() => onParagraphPlaybackToggle(item)}
-                                  >
-                                    {playingParagraphId === item.id ? <Pause /> : <Play />}
-                                    {playingParagraphId === item.id ? "Pause" : "Play"}
-                                  </Button>
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    disabled={generationStatus === "running" || !selectedModel}
-                                    onClick={() => void onRetryParagraph(item.id)}
-                                  >
-                                    <RefreshCcw />
-                                    Retry
-                                  </Button>
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    disabled={generationStatus === "running" || !selectedModel}
-                                    onClick={() => void onGenerateFromParagraph(item.id)}
-                                  >
-                                    <Play />
-                                    Generate from here
-                                  </Button>
-                                  {!hasParagraphAudio(item) ? (
-                                    <span className="text-xs text-muted-foreground">No audio</span>
-                                  ) : null}
-                                </div>
-                              )}
-                            </PopoverContent>
-
-                            <div className="absolute -left-10 top-1/2 z-10 -translate-y-1/2">
-                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                  <button
-                                    type="button"
-                                    disabled={generationStatus === "running" || models.length === 0}
-                                    className="rounded-full transition-transform hover:scale-[1.02] disabled:cursor-not-allowed disabled:opacity-50"
-                                    aria-label="Change paragraph speaker"
-                                  >
-                                    <SpeakerAvatar
-                                      name={
-                                        models.find((model) => model.id === item.speakerModelId)?.name ??
-                                        selectedModel?.name ??
-                                        "Voice"
-                                      }
-                                    />
-                                  </button>
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent side="right" align="start" className="w-56">
-                                  <DropdownMenuLabel className="text-xs text-muted-foreground">
-                                    Paragraph speaker
-                                  </DropdownMenuLabel>
-                                  <DropdownMenuRadioGroup
-                                    value={
-                                      models.some((model) => model.id === item.speakerModelId)
-                                        ? item.speakerModelId
-                                        : selectedModel?.id ?? ""
-                                    }
-                                    onValueChange={(nextValue: string) =>
-                                      onParagraphSpeakerChange(item.id, nextValue)
-                                    }
-                                  >
-                                    {models.map((model) => (
-                                      <DropdownMenuRadioItem key={model.id} value={model.id}>
-                                        {model.name}
-                                      </DropdownMenuRadioItem>
-                                    ))}
-                                  </DropdownMenuRadioGroup>
-                                </DropdownMenuContent>
-                              </DropdownMenu>
-                            </div>
-
-                            <span
-                              className={`pointer-events-none absolute bottom-2 left-0 top-2 w-[3px] rounded-full ${paragraphStripClass[item.status]}`}
-                              aria-hidden
-                            />
-                            {item.status === "generating" ? (
-                              <Loader2 className="absolute -left-4 top-1/2 size-4 -translate-y-1/2 animate-spin text-muted-foreground" />
-                            ) : null}
-
-                            <Textarea
-                              ref={(node) => setParagraphTextareaRef(item.id, node)}
-                              className={`min-h-16 resize-none border-0 bg-transparent px-0 pr-5 pl-7 shadow-none outline-none selection:bg-sky-200 selection:text-foreground focus-visible:ring-0 ${
-                                generationStatus === "running" && item.status === "ok"
-                                  ? "cursor-pointer"
-                                  : ""
-                              }`}
-                              value={item.text}
-                              disabled={generationStatus === "running" && item.status !== "ok"}
-                              readOnly={generationStatus === "running" && item.status === "ok"}
-                              onChange={(event) => onParagraphTextChange(item.id, event.target.value)}
-                              onClick={(event) => onParagraphClick(item.id, event)}
-                            />
-                            {item.error ? <p className="mt-2 text-xs text-destructive">{item.error}</p> : null}
-                          </article>
-                        </Popover>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-            </div>
+            <ScriptWorkspace
+              activeParagraphId={activeParagraphId}
+              canGenerate={canGenerate}
+              generationStatus={generationStatus}
+              inputText={inputText}
+              models={models}
+              orderedSelectedParagraphIds={orderedSelectedParagraphIds}
+              paragraphs={paragraphs}
+              playingParagraphId={playingParagraphId}
+              selectedModel={selectedModel}
+              selectedModelId={selectedModelId}
+              selectedParagraphIdSet={selectedParagraphIdSet}
+              applyInputText={applyInputText}
+              hasParagraphAudio={hasParagraphAudio}
+              onCancelGeneration={onCancelGeneration}
+              onGenerateAll={() => void onGenerateAll()}
+              onGenerateFromParagraph={(paragraphId) => void onGenerateFromParagraph(paragraphId)}
+              onGenerateSelectedParagraphs={() => void onGenerateSelectedParagraphs()}
+              onParagraphClick={onParagraphClick}
+              onParagraphContextMenu={onParagraphContextMenu}
+              onParagraphPlaybackToggle={onParagraphPlaybackToggle}
+              onParagraphSpeakerChange={onParagraphSpeakerChange}
+              onParagraphTextChange={onParagraphTextChange}
+              onRetryParagraph={(paragraphId) => void onRetryParagraph(paragraphId)}
+              setActiveParagraphId={setActiveParagraphId}
+              setParagraphTextareaRef={setParagraphTextareaRef}
+            />
           </div>
 
-          <footer className="fixed right-0 bottom-0 left-0 z-30 border-t border-border/80 bg-background/95 backdrop-blur md:left-[320px]">
-            <div className="mx-auto w-full max-w-5xl px-4 py-3 md:px-6">
-              <div className="grid grid-cols-[1fr_auto_1fr] items-center">
-                <div />
-                <div className="flex justify-center">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={!hasPlayableTimeline}
-                    onClick={onTimelineToggle}
-                    className="size-11 rounded-full p-0"
-                    aria-label={isTimelinePlaying ? "Pause timeline" : "Play timeline"}
-                  >
-                    {isTimelinePlaying ? <Pause className="size-5" /> : <Play className="size-5" />}
-                  </Button>
-                </div>
-                <p className="text-right text-xs text-muted-foreground">
-                  {timelineCurrentParagraph
-                    ? `Paragraph ${timelineCurrentIndex !== null ? timelineCurrentIndex + 1 : ""}`
-                    : `${playableParagraphIndexes.length} clip${playableParagraphIndexes.length === 1 ? "" : "s"}`}
-                </p>
-              </div>
-
-              <div className="mt-2 flex items-center gap-3">
-                <span className="w-10 text-xs tabular-nums text-muted-foreground">
-                  {formatDurationLabel(timelinePositionSec)}
-                </span>
-                <Slider
-                  min={0}
-                  max={Math.max(totalTimelineDuration, 0)}
-                  step={0.01}
-                  value={[Math.min(timelinePositionSec, Math.max(totalTimelineDuration, 0))]}
-                  onValueChange={(nextValue) => {
-                    const next = nextValue[0] ?? 0;
-                    const clamped = Math.max(0, Math.min(next, totalTimelineDuration));
-                    setTimelinePositionSec(clamped);
-                  }}
-                  onValueCommitted={(nextValue) => {
-                    const shouldResume = shouldResumeAfterSeekRef.current;
-                    shouldResumeAfterSeekRef.current = false;
-                    isTimelineScrubbingRef.current = false;
-                    onTimelineSeek(nextValue[0] ?? 0, shouldResume);
-                  }}
-                  onScrubStart={onTimelineScrubStart}
-                  onScrubEnd={onTimelineScrubEnd}
-                  disabled={!hasPlayableTimeline || totalTimelineDuration <= 0}
-                  aria-label="Timeline seek"
-                />
-                <span className="w-10 text-right text-xs tabular-nums text-muted-foreground">
-                  {formatDurationLabel(totalTimelineDuration)}
-                </span>
-              </div>
-            </div>
-          </footer>
+          <TimelineFooter
+            currentIndex={timelineCurrentIndex}
+            currentParagraph={timelineCurrentParagraph}
+            hasPlayableTimeline={hasPlayableTimeline}
+            isPlaying={isTimelinePlaying}
+            playableCount={playableParagraphIndexes.length}
+            positionSec={timelinePositionSec}
+            totalDuration={totalTimelineDuration}
+            formatDurationLabel={formatDurationLabel}
+            onPositionPreview={setTimelinePositionSec}
+            onScrubEnd={onTimelineScrubEnd}
+            onScrubStart={onTimelineScrubStart}
+            onSeekCommit={onTimelineSeek}
+            onToggle={onTimelineToggle}
+            shouldResumeAfterSeekRef={shouldResumeAfterSeekRef}
+            isTimelineScrubbingRef={isTimelineScrubbingRef}
+          />
         </section>
       </div>
       <VoiceManagerDrawer

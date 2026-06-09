@@ -40,6 +40,12 @@ class ProjectStore:
         project = Project(id=str(uuid.uuid4()), name=name, created_at=timestamp, updated_at=timestamp)
         return self.save(project)
 
+    def delete(self, project_id: str) -> None:
+        path = projects_dir() / f"{project_id}.json"
+        if not path.exists():
+            raise NotFoundError("Project not found.")
+        path.unlink()
+
 
 class VoiceStore:
     def list(self) -> list[VoicePreset]:
@@ -93,6 +99,31 @@ class VoiceStore:
         if not path.exists():
             raise NotFoundError("Voice preset not found.")
         return VoicePreset.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def find(self, value: str) -> VoicePreset:
+        normalized = value.strip()
+        for voice in self.list():
+            path = Path(voice.path)
+            if voice.id == normalized or voice.name == normalized or path.name == normalized:
+                return voice
+        raise NotFoundError("Voice preset not found.")
+
+    def rename(self, voice_id: str, name: str) -> VoicePreset:
+        voice = self.find(voice_id)
+        voice.name = name
+        (voices_dir() / f"{voice.id}.json").write_text(
+            voice.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        return voice
+
+    def delete(self, voice_id: str) -> None:
+        voice = self.find(voice_id)
+        path = Path(voice.path)
+        path.unlink(missing_ok=True)
+        (voices_dir() / f"{voice.id}.json").unlink(missing_ok=True)
+        reference_path = voices_dir() / f"{voice.id}-reference{path.suffix}"
+        reference_path.unlink(missing_ok=True)
 
 
 project_store = ProjectStore()
