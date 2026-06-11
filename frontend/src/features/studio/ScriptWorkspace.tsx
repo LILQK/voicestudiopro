@@ -113,7 +113,7 @@ export function ScriptWorkspace({
             disabled={generationStatus === "running"}
           />
         ) : (
-          <div className="pr-1">
+          <div className="ml-8 space-y-1 pr-1">
             {paragraphs.map((item) => {
               const isSelected = selectedParagraphIdSet.has(item.id);
               const hasMultiSelectionContext = isSelected && orderedSelectedParagraphIds.length > 1;
@@ -131,7 +131,7 @@ export function ScriptWorkspace({
                   }}
                 >
                   <article
-                    className={`relative py-1.5 pl-4 pr-1 ${
+                    className={`relative pl-4 pr-1 ${
                       hasMultiSelectionContext
                         ? "rounded-md border border-sky-300/70 bg-sky-100/70"
                         : isSelected
@@ -200,16 +200,17 @@ export function ScriptWorkspace({
                       )}
                     </PopoverContent>
 
-                    <div className="absolute -left-10 top-1/2 z-10 -translate-y-1/2">
+                    <div className="absolute -left-8 top-1/2 z-10 -translate-y-1/2">
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <button
                             type="button"
                             disabled={generationStatus === "running" || models.length === 0}
-                            className="rounded-full transition-transform hover:scale-[1.02] disabled:cursor-not-allowed disabled:opacity-50"
+                            className="rounded-full p-0 transition-transform hover:scale-[1.02] disabled:cursor-not-allowed disabled:opacity-50"
                             aria-label="Change paragraph speaker"
                           >
                             <SpeakerAvatar
+                              className="size-6 text-[9px]"
                               name={
                                 models.find((model) => model.id === item.speakerModelId)?.name ??
                                 selectedModel?.name ??
@@ -243,7 +244,7 @@ export function ScriptWorkspace({
                     </div>
 
                     <span
-                      className={`pointer-events-none absolute bottom-2 left-0 top-2 w-[3px] rounded-full ${paragraphStripClass[item.status]}`}
+                      className={`pointer-events-none absolute bottom-1 left-0 top-1 w-[3px] rounded-full ${paragraphStripClass[item.status]}`}
                       aria-hidden
                     />
                     {item.status === "generating" ? (
@@ -252,7 +253,7 @@ export function ScriptWorkspace({
 
                     <Textarea
                       ref={(node) => setParagraphTextareaRef(item.id, node)}
-                      className={`min-h-16 resize-none border-0 bg-transparent px-0 pr-5 pl-7 shadow-none outline-none selection:bg-sky-200 selection:text-foreground focus-visible:ring-0 ${
+                      className={`min-h-6 resize-none border-0 bg-transparent py-0 pr-5 pl-7 leading-6 shadow-none outline-none selection:bg-sky-200 selection:text-foreground focus-visible:ring-0 ${
                         generationStatus === "running" && item.status === "ok" ? "cursor-pointer" : ""
                       }`}
                       value={item.text}
@@ -261,7 +262,7 @@ export function ScriptWorkspace({
                       onChange={(event) => onParagraphTextChange(item.id, event.target.value)}
                       onClick={(event) => onParagraphClick(item.id, event)}
                     />
-                    {item.error ? <p className="mt-2 text-xs text-destructive">{item.error}</p> : null}
+                    {item.error ? <p className="mt-1 text-xs text-destructive">{item.error}</p> : null}
                   </article>
                 </Popover>
               );
