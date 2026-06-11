@@ -3,6 +3,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { VoiceManagerDrawer } from "@/components/voice-manager-drawer";
 import { exportPremierePackage, exportWav } from "@/features/export/exportAudio";
 import { ExportMenu } from "@/features/export/ExportMenu";
+import { Onboarding } from "@/features/onboarding/Onboarding";
 import { ProjectsPanel, type DisplayProjectItem } from "@/features/projects/ProjectsPanel";
 import {
   buildProjectContentSignature,
@@ -56,12 +57,19 @@ import {
   type StoredParagraph,
   type StoredProject,
 } from "@/lib/projectsStore";
+import {
+  api as runtimeApi,
+} from "@/shared/api/client";
+import { useStudioStore } from "@/shared/state/studioStore";
 const ACCEPTED_MODEL_EXTENSIONS = new Set([".pt", ".pth", ".bin"]);
 
 
 function App() {
   const initialProjectTimestampRef = useRef<number>(Date.now());
+  const runtime = useStudioStore((state) => state.runtime);
+  const setRuntime = useStudioStore((state) => state.setRuntime);
   const [qwenState, setQwenState] = useState<QwenState | null>(null);
+  const [runtimeBootError, setRuntimeBootError] = useState<string | null>(null);
   const [inputText, setInputText] = useState("");
   const [projects, setProjects] = useState<ProjectHistoryItem[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string>(() => createId());
@@ -91,6 +99,34 @@ function App() {
   const activeProjectCreatedAtRef = useRef<number>(initialProjectTimestampRef.current);
   const hydratingProjectRef = useRef(false);
   const lastPersistedProjectSignatureRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    const loadRuntime = async (): Promise<void> => {
+      try {
+        const nextRuntime = await runtimeApi.runtime();
+        if (!active) {
+          return;
+        }
+        setRuntime(nextRuntime);
+        setRuntimeBootError(null);
+      } catch (error) {
+        if (!active) {
+          return;
+        }
+        setRuntimeBootError(
+          error instanceof Error ? error.message : "Unable to connect to the local backend.",
+        );
+      }
+    };
+
+    void loadRuntime();
+
+    return () => {
+      active = false;
+    };
+  }, [setRuntime]);
 
   const setParagraphTextareaRef = useCallback(
     (id: string, node: HTMLTextAreaElement | null): void => {
@@ -887,6 +923,29 @@ function App() {
       setExportingKind(null);
     }
   };
+
+  if (runtimeBootError && !runtime) {
+    return (
+      <main className="grid min-h-screen place-items-center bg-background px-6 text-foreground">
+        <Alert variant="destructive" className="max-w-xl">
+          <AlertTitle>Backend unavailable</AlertTitle>
+          <AlertDescription>{runtimeBootError}</AlertDescription>
+        </Alert>
+      </main>
+    );
+  }
+
+  if (!runtime) {
+    return (
+      <main className="grid min-h-screen place-items-center bg-background text-sm text-muted-foreground">
+        Starting VoiceStudio Pro...
+      </main>
+    );
+  }
+
+  if (runtime.status !== "ready") {
+    return <Onboarding runtime={runtime} />;
+  }
 
   return (
     <main className="min-h-screen bg-background text-foreground">

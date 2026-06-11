@@ -22,38 +22,6 @@ export type RuntimeState = {
   last_error: string | null;
 };
 
-export type VoicePreset = {
-  id: string;
-  name: string;
-  kind: string;
-  path: string;
-  size: number;
-  created_at: number;
-};
-
-export type Paragraph = {
-  id: string;
-  text: string;
-  voice_id: string | null;
-  status: "pending" | "running" | "ok" | "error";
-  audio_path?: string | null;
-  audio_url?: string | null;
-  error?: string | null;
-};
-
-export type GenerationJob = {
-  id: string;
-  status: "queued" | "running" | "completed" | "partial_error" | "cancelled" | "error";
-  progress: number;
-  message: string;
-  results: Array<{
-    paragraph_id: string;
-    status: string;
-    audio_url: string | null;
-    error: string | null;
-  }>;
-};
-
 const readJson = async <T>(response: Response): Promise<T> => {
   const text = await response.text();
   const json = text ? JSON.parse(text) : null;
@@ -72,34 +40,4 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ torch_variant, include_qwen: true }),
     }).then((response) => readJson<RuntimeState>(response)),
-  voices: () => fetch("/api/voices").then((response) => readJson<VoicePreset[]>(response)),
-  uploadVoice: (name: string, file: File, transcript?: string) => {
-    const form = new FormData();
-    form.append("name", name);
-    form.append("file", file);
-    if (transcript) {
-      form.append("transcript", transcript);
-    }
-    return fetch("/api/voices", { method: "POST", body: form }).then((response) =>
-      readJson<VoicePreset>(response),
-    );
-  },
-  createGenerationJob: (paragraphs: Paragraph[]) =>
-    fetch("/api/generation/jobs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        paragraphs: paragraphs.map((paragraph) => ({
-          id: paragraph.id,
-          text: paragraph.text,
-          voice_id: paragraph.voice_id,
-        })),
-      }),
-    }).then((response) => readJson<GenerationJob>(response)),
-  generationJob: (jobId: string) =>
-    fetch(`/api/generation/jobs/${jobId}`).then((response) => readJson<GenerationJob>(response)),
-  cancelGenerationJob: (jobId: string) =>
-    fetch(`/api/generation/jobs/${jobId}/cancel`, { method: "POST" }).then((response) =>
-      readJson<GenerationJob>(response),
-    ),
 };

@@ -8,6 +8,7 @@
     "dev:web": "vite --config frontend/vite.config.ts --host 127.0.0.1 --port 5173",
     "dev:backend": "python -m app.backend.main",
     "build": "vite build --config frontend/vite.config.ts",
+    "build:desktop": "powershell -ExecutionPolicy Bypass -File scripts\\build-exe.ps1",
     "preview": "vite preview --config frontend/vite.config.ts --host 127.0.0.1 --port 4173",
     "typecheck": "tsc -p frontend/tsconfig.json --noEmit"
   },

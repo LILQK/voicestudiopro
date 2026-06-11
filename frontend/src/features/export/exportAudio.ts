@@ -19,6 +19,27 @@ type PremiereExportClip = {
   endFrame: number;
 };
 
+type NativeSaveResult = {
+  ok: boolean;
+  cancelled?: boolean;
+  error?: string;
+  path?: string;
+};
+
+declare global {
+  interface Window {
+    pywebview?: {
+      api?: {
+        save_export?: (
+          fileName: string,
+          base64Data: string,
+          fileTypes: string[],
+        ) => Promise<NativeSaveResult>;
+      };
+    };
+  }
+}
+
 const encodeWav = (buffer: AudioBuffer): Blob => {
   const channels = buffer.numberOfChannels;
   const sampleRate = buffer.sampleRate;
@@ -61,6 +82,20 @@ const encodeWav = (buffer: AudioBuffer): Blob => {
   return new Blob([wavBuffer], { type: "audio/wav" });
 };
 
+const blobToBase64 = (blob: Blob): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Unable to prepare export file."));
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error("Unable to prepare export file."));
+        return;
+      }
+      resolve(reader.result.split(",", 2)[1] ?? "");
+    };
+    reader.readAsDataURL(blob);
+  });
+
 const downloadBlob = (blob: Blob, fileName: string): void => {
   const downloadUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -70,6 +105,22 @@ const downloadBlob = (blob: Blob, fileName: string): void => {
   link.click();
   link.remove();
   URL.revokeObjectURL(downloadUrl);
+};
+
+const saveBlob = async (blob: Blob, fileName: string, fileTypes: string[]): Promise<void> => {
+  const nativeSave = window.pywebview?.api?.save_export;
+  if (!nativeSave) {
+    downloadBlob(blob, fileName);
+    return;
+  }
+
+  const result = await nativeSave(fileName, await blobToBase64(blob), fileTypes);
+  if (result.cancelled) {
+    return;
+  }
+  if (!result.ok) {
+    throw new Error(result.error ?? "Unable to save export file.");
+  }
 };
 
 const xmlEscape = (value: string): string =>
@@ -313,7 +364,10 @@ export const exportWav = async (paragraphs: ParagraphItem[]): Promise<void> => {
       writeOffset += buffer.length;
     }
 
-    downloadBlob(encodeWav(merged), "voicestudio-export.wav");
+    await saveBlob(encodeWav(merged), "voicestudio-export.wav", [
+      "WAV audio (*.wav)",
+      "All files (*.*)",
+    ]);
   } finally {
     await audioContext.close();
   }
@@ -442,7 +496,10 @@ export const exportPremierePackage = async ({
       ].join("\n"),
     );
 
-    downloadBlob(await zip.generateAsync({ type: "blob" }), "voicestudio-premiere-package.zip");
+    await saveBlob(await zip.generateAsync({ type: "blob" }), "voicestudio-premiere-package.zip", [
+      "ZIP archives (*.zip)",
+      "All files (*.*)",
+    ]);
   } finally {
     await audioContext.close();
   }
