@@ -62,6 +62,15 @@ npm run build
 python -m app.desktop.main
 ```
 
+## Automated Releases
+
+Pushing a Git tag like `v0.1.0` now triggers GitHub Actions on Windows to:
+
+- build the desktop app with PyInstaller
+- package a portable ZIP
+- compile an Inno Setup installer
+- publish all generated files to the matching GitHub release
+
 ## Runtime Strategy
 
 The packaged app should stay small. Heavy ML dependencies are installed on first run into:
@@ -71,4 +80,3 @@ The packaged app should stay small. Heavy ML dependencies are installed on first
 ```
 
 Torch is selected by hardware compatibility. If NVIDIA/CUDA is unavailable or unsupported, the installer falls back to CPU mode with a clear status in the onboarding UI.
-
